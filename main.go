@@ -559,13 +559,34 @@ func (r *mp4Recorder) write(m *message) {
 }
 
 func (r *mp4Recorder) stop() {
-	mdatSize := r.pos - r.mdatPos
-	r.f.Seek(r.mdatPos, io.SeekStart)
-	var b [4]byte
-	binary.BigEndian.PutUint32(b[:], uint32(mdatSize))
-	r.f.Write(b[:])
-	r.f.Seek(r.pos, io.SeekStart)
-	r.f.Write(r.moov())
+	// Read mdat data from file (everything after ftyp + mdat header).
+	mdatDataLen := r.pos - (r.mdatPos + 8)
+	r.f.Seek(r.mdatPos+8, io.SeekStart)
+	mdatData := make([]byte, mdatDataLen)
+	io.ReadFull(r.f, mdatData)
+
+	// Build moov to learn its size, then shift all sample offsets so
+	// co64 entries account for moov being inserted before mdat (faststart).
+	moov := r.moov()
+	moovSize := int64(len(moov))
+	for i := range r.tracks {
+		for j := range r.tracks[i].samples {
+			r.tracks[i].samples[j].offset += moovSize
+		}
+	}
+	moov = r.moov()
+
+	// Rewrite file: ftyp | moov | mdat — playable over HTTP without range seeks.
+	ftypLen := int64(len(mp4Ftyp()))
+	mdatTotal := r.pos - r.mdatPos
+	r.f.Seek(ftypLen, io.SeekStart)
+	r.f.Write(moov)
+	var mdatHdr [8]byte
+	binary.BigEndian.PutUint32(mdatHdr[:4], uint32(mdatTotal))
+	copy(mdatHdr[4:], "mdat")
+	r.f.Write(mdatHdr[:])
+	r.f.Write(mdatData)
+	r.f.Truncate(ftypLen + moovSize + mdatTotal)
 	r.f.Close()
 }
 
@@ -1131,7 +1152,7 @@ func (tm *taskManager) handleStart(w http.ResponseWriter, r *http.Request) {
 		ID: id, Path: req.Path, Method: req.Method,
 		State: stateRecording, StartedAt: time.Now(),
 		Filename: filename,
-		rec: rec, stopCh: make(chan struct{}), st: s, subCh: ch,
+		rec:      rec, stopCh: make(chan struct{}), st: s, subCh: ch,
 	}
 
 	tm.mu.Lock()
