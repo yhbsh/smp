@@ -901,6 +901,7 @@ func newRecorder(method, dir, streamPath string, header *message) (recorder, str
 
 type server struct {
 	hub *hub
+	dir string
 }
 
 func (srv *server) handle(conn net.Conn) {
@@ -958,6 +959,25 @@ func (srv *server) servePush(conn net.Conn, s *stream, peer string, seamless boo
 	var packets uint64
 	var keyframes uint64
 	var bytes uint64
+	var rec recorder
+	var recFile string
+
+	defer func() {
+		if rec != nil {
+			rec.stop()
+			logger.Info("auto-record stopped", "peer", peer, "path", s.path, "file", recFile)
+			go func() {
+				s3Key := "recordings/" + filepath.Base(recFile)
+				s3URL, err := uploadToS3(recFile, s3Key)
+				if err != nil {
+					logger.Error("auto-record upload failed", "file", recFile, "err", err)
+				} else {
+					os.Remove(recFile)
+					logger.Info("auto-record uploaded", "url", s3URL)
+				}
+			}()
+		}
+	}()
 
 	for {
 		m, err := readMessage(conn)
@@ -984,6 +1004,16 @@ func (srv *server) servePush(conn net.Conn, s *stream, peer string, seamless boo
 				logger.Debug("header unchanged on reconnect", "peer", peer, "path", s.path)
 			}
 			first = false
+
+			r, fn, err := newRecorder("mp4", srv.dir, s.path, m)
+			if err != nil {
+				logger.Warn("auto-record failed to start", "path", s.path, "err", err)
+			} else {
+				rec = r
+				recFile = fn
+				rec.write(m)
+				logger.Info("auto-record started", "peer", peer, "path", s.path, "file", recFile)
+			}
 			continue
 		}
 
@@ -1003,6 +1033,10 @@ func (srv *server) servePush(conn net.Conn, s *stream, peer string, seamless boo
 		default:
 			logger.Warn("unknown message type",
 				"peer", peer, "path", s.path, "type", fmt.Sprintf("0x%02x", m.mtype))
+		}
+
+		if rec != nil {
+			rec.write(m)
 		}
 	}
 }
@@ -1368,7 +1402,7 @@ func main() {
 	tm := &taskManager{tasks: make(map[string]*recordTask), hub: h, dir: dir}
 	go tm.serve(*apiAddr)
 
-	srv := &server{hub: h}
+	srv := &server{hub: h, dir: dir}
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
