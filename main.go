@@ -52,13 +52,18 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -874,9 +879,7 @@ func newRecorder(method, dir, streamPath string, header *message) (recorder, str
 // --- server ---
 
 type server struct {
-	hub          *hub
-	recordDir    string
-	recordMethod string
+	hub *hub
 }
 
 func (srv *server) handle(conn net.Conn) {
@@ -934,15 +937,6 @@ func (srv *server) servePush(conn net.Conn, s *stream, peer string, seamless boo
 	var packets uint64
 	var keyframes uint64
 	var bytes uint64
-	var rec recorder
-	var recFile string
-
-	defer func() {
-		if rec != nil {
-			rec.stop()
-			logger.Info("recording stopped", "file", recFile)
-		}
-	}()
 
 	for {
 		m, err := readMessage(conn)
@@ -969,18 +963,6 @@ func (srv *server) servePush(conn net.Conn, s *stream, peer string, seamless boo
 				logger.Debug("header unchanged on reconnect", "peer", peer, "path", s.path)
 			}
 			first = false
-
-			if srv.recordDir != "" {
-				r, fn, err := newRecorder(srv.recordMethod, srv.recordDir, s.path, m)
-				if err != nil {
-					logger.Warn("recording failed to start", "path", s.path, "err", err)
-				} else {
-					rec = r
-					recFile = fn
-					rec.write(m)
-					logger.Info("recording started", "file", recFile)
-				}
-			}
 			continue
 		}
 
@@ -1000,10 +982,6 @@ func (srv *server) servePush(conn net.Conn, s *stream, peer string, seamless boo
 		default:
 			logger.Warn("unknown message type",
 				"peer", peer, "path", s.path, "type", fmt.Sprintf("0x%02x", m.mtype))
-		}
-
-		if rec != nil {
-			rec.write(m)
 		}
 	}
 }
@@ -1058,13 +1036,296 @@ func modeName(m byte) string {
 	}
 }
 
+// --- recording tasks ---
+
+type taskState string
+
+const (
+	stateRecording taskState = "recording"
+	stateUploading taskState = "uploading"
+	stateDone      taskState = "done"
+	stateFailed    taskState = "failed"
+
+	defaultMaxDuration = 3600
+	maxMaxDuration     = 14400 // 4 hours hard cap
+)
+
+type recordTask struct {
+	ID        string    `json:"id"`
+	Path      string    `json:"path"`
+	Method    string    `json:"method"`
+	State     taskState `json:"state"`
+	StartedAt time.Time `json:"started_at"`
+	Filename  string    `json:"filename,omitempty"`
+	S3URL     string    `json:"s3_url,omitempty"`
+	Error     string    `json:"error,omitempty"`
+
+	rec    recorder
+	stopCh chan struct{}
+	st     *stream
+	subCh  chan *message
+}
+
+type taskManager struct {
+	mu    sync.Mutex
+	tasks map[string]*recordTask
+	hub   *hub
+	dir   string
+}
+
+func randomID() string {
+	b := make([]byte, 8)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func (tm *taskManager) handleStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	var req struct {
+		Path        string `json:"path"`
+		Method      string `json:"method"`
+		MaxDuration int    `json:"max_duration"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	if req.Path == "" {
+		http.Error(w, `{"error":"path required"}`, 400)
+		return
+	}
+	if req.Method == "" {
+		req.Method = "mp4"
+	}
+	if req.MaxDuration <= 0 {
+		req.MaxDuration = defaultMaxDuration
+	}
+	if req.MaxDuration > maxMaxDuration {
+		req.MaxDuration = maxMaxDuration
+	}
+
+	s := tm.hub.get(req.Path)
+	ch, header, gop, ok := s.subscribe()
+	if !ok {
+		http.Error(w, `{"error":"no publisher on path or timed out"}`, 404)
+		return
+	}
+
+	rec, filename, err := newRecorder(req.Method, tm.dir, req.Path, header)
+	if err != nil {
+		s.unsubscribe(ch)
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), 500)
+		return
+	}
+
+	rec.write(header)
+	for _, m := range gop {
+		rec.write(m)
+	}
+
+	id := randomID()
+	task := &recordTask{
+		ID: id, Path: req.Path, Method: req.Method,
+		State: stateRecording, StartedAt: time.Now(),
+		Filename: filename,
+		rec: rec, stopCh: make(chan struct{}), st: s, subCh: ch,
+	}
+
+	tm.mu.Lock()
+	tm.tasks[id] = task
+	tm.mu.Unlock()
+
+	go tm.recordLoop(task, time.Duration(req.MaxDuration)*time.Second)
+
+	logger.Info("recording started", "task", id, "path", req.Path, "file", filename)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"task_id": id})
+}
+
+func (tm *taskManager) handleStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	var req struct {
+		TaskID string `json:"task_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	tm.mu.Lock()
+	task, ok := tm.tasks[req.TaskID]
+	tm.mu.Unlock()
+	if !ok {
+		http.Error(w, `{"error":"task not found"}`, 404)
+		return
+	}
+	if task.State != stateRecording {
+		http.Error(w, fmt.Sprintf(`{"error":"task not recording, state=%s"}`, task.State), 409)
+		return
+	}
+
+	close(task.stopCh)
+	logger.Info("recording stop requested", "task", req.TaskID)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"task_id": req.TaskID, "state": "stopping"})
+}
+
+func (tm *taskManager) handleTasks(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	tm.mu.Lock()
+	out := make([]*recordTask, 0, len(tm.tasks))
+	for _, t := range tm.tasks {
+		out = append(out, t)
+	}
+	tm.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+}
+
+func (tm *taskManager) recordLoop(task *recordTask, maxDur time.Duration) {
+	timer := time.NewTimer(maxDur)
+	defer timer.Stop()
+
+	for {
+		select {
+		case m, ok := <-task.subCh:
+			if !ok {
+				goto stop
+			}
+			task.rec.write(m)
+		case <-timer.C:
+			logger.Warn("recording auto-stopped (max duration)", "task", task.ID, "path", task.Path)
+			goto stop
+		case <-task.stopCh:
+			goto stop
+		}
+	}
+
+stop:
+	task.st.unsubscribe(task.subCh)
+	task.rec.stop()
+
+	tm.mu.Lock()
+	task.State = stateUploading
+	tm.mu.Unlock()
+	logger.Info("recording stopped, uploading", "task", task.ID, "file", task.Filename)
+
+	s3Key := "recordings/" + filepath.Base(task.Filename)
+	s3URL, err := uploadToS3(task.Filename, s3Key)
+
+	tm.mu.Lock()
+	if err != nil {
+		task.State = stateFailed
+		task.Error = err.Error()
+		logger.Error("s3 upload failed", "task", task.ID, "err", err)
+	} else {
+		task.State = stateDone
+		task.S3URL = s3URL
+		os.Remove(task.Filename)
+		logger.Info("recording uploaded", "task", task.ID, "url", s3URL)
+	}
+	tm.mu.Unlock()
+}
+
+func (tm *taskManager) serve(addr string) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/record/start", tm.handleStart)
+	mux.HandleFunc("/record/stop", tm.handleStop)
+	mux.HandleFunc("/record/tasks", tm.handleTasks)
+	logger.Info("api listening", "addr", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		logger.Fatal("api listen failed", "err", err)
+	}
+}
+
+// --- s3 upload ---
+
+func uploadToS3(filePath, s3Key string) (string, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+
+	now := time.Now().UTC()
+	date := now.Format("20060102")
+	datetime := now.Format("20060102T150405Z")
+
+	host := fmt.Sprintf("%s.s3.%s.amazonaws.com", awsBucket, awsRegion)
+	endpoint := fmt.Sprintf("https://%s/%s", host, s3Key)
+
+	ct := "application/octet-stream"
+	if strings.HasSuffix(filePath, ".mp4") {
+		ct = "video/mp4"
+	}
+
+	canonicalHeaders := fmt.Sprintf("content-type:%s\nhost:%s\nx-amz-content-sha256:UNSIGNED-PAYLOAD\nx-amz-date:%s\n",
+		ct, host, datetime)
+	signedHeaders := "content-type;host;x-amz-content-sha256;x-amz-date"
+	canonicalRequest := fmt.Sprintf("PUT\n/%s\n\n%s\n%s\nUNSIGNED-PAYLOAD", s3Key, canonicalHeaders, signedHeaders)
+
+	scope := fmt.Sprintf("%s/%s/s3/aws4_request", date, awsRegion)
+	hash := sha256.Sum256([]byte(canonicalRequest))
+	stringToSign := fmt.Sprintf("AWS4-HMAC-SHA256\n%s\n%s\n%s", datetime, scope, hex.EncodeToString(hash[:]))
+
+	kDate := hmacSHA256([]byte("AWS4"+awsSecretKey), []byte(date))
+	kRegion := hmacSHA256(kDate, []byte(awsRegion))
+	kService := hmacSHA256(kRegion, []byte("s3"))
+	kSigning := hmacSHA256(kService, []byte("aws4_request"))
+	sig := hex.EncodeToString(hmacSHA256(kSigning, []byte(stringToSign)))
+
+	auth := fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
+		awsAccessKeyID, scope, signedHeaders, sig)
+
+	req, _ := http.NewRequest("PUT", endpoint, f)
+	req.ContentLength = stat.Size()
+	req.Header.Set("Content-Type", ct)
+	req.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+	req.Header.Set("X-Amz-Date", datetime)
+	req.Header.Set("Authorization", auth)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode/100 != 2 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("s3: %d %s", resp.StatusCode, string(body))
+	}
+
+	return endpoint, nil
+}
+
+func hmacSHA256(key, data []byte) []byte {
+	h := hmac.New(sha256.New, key)
+	h.Write(data)
+	return h.Sum(nil)
+}
+
 // --- main ---
 
 func main() {
 	addr := flag.String("addr", ":7777", "listen address")
+	apiAddr := flag.String("api", ":7778", "HTTP API address for recording control")
 	logLvl := flag.String("log", "info", "log level (debug|info|warn|error)")
-	recordDir := flag.String("record", "", "directory to save recordings (empty=disabled)")
-	recordMethod := flag.String("record-method", "mp4", "recording method: mp4, ffmpeg, smp")
 	flag.Parse()
 
 	lvl, err := parseLevel(*logLvl)
@@ -1079,14 +1340,14 @@ func main() {
 	}
 	logger.Info("smp listening", "addr", ln.Addr().String(), "level", *logLvl)
 
-	if *recordDir != "" {
-		if err := os.MkdirAll(*recordDir, 0755); err != nil {
-			logger.Fatal("cannot create record dir", "dir", *recordDir, "err", err)
-		}
-		logger.Info("recording enabled", "dir", *recordDir)
-	}
+	h := newHub()
 
-	srv := &server{hub: newHub(), recordDir: *recordDir, recordMethod: *recordMethod}
+	dir := "recordings"
+	os.MkdirAll(dir, 0755)
+	tm := &taskManager{tasks: make(map[string]*recordTask), hub: h, dir: dir}
+	go tm.serve(*apiAddr)
+
+	srv := &server{hub: h}
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
