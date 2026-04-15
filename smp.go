@@ -654,12 +654,18 @@ func (r *mp4Recorder) write(m *message) {
 	if idx >= len(r.tracks) {
 		return
 	}
+	data := pkt.data
+	// Convert Annex B start codes to length-prefixed NALUs for H.264/HEVC in MP4.
+	codecID := r.tracks[idx].info.codecID
+	if codecID == avCodecH264 || codecID == avCodecHEVC {
+		data = annexBToMP4(data)
+	}
 	r.tracks[idx].samples = append(r.tracks[idx].samples, sampleMeta{
-		offset: r.pos, size: uint32(len(pkt.data)),
+		offset: r.pos, size: uint32(len(data)),
 		dts: pkt.dts, pts: pkt.pts, dur: pkt.duration, key: pkt.keyframe,
 	})
-	r.f.Write(pkt.data)
-	r.pos += int64(len(pkt.data))
+	r.f.Write(data)
+	r.pos += int64(len(data))
 }
 
 func (r *mp4Recorder) stop() {
@@ -858,13 +864,219 @@ func mp4DOps(si streamInfo) []byte {
 	return bx("dOps", b)
 }
 
+// --- Annex B / MP4 bitstream conversion ---
+
+// isAnnexB reports whether data starts with a NAL start code.
+func isAnnexB(data []byte) bool {
+	if len(data) >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1 {
+		return true
+	}
+	if len(data) >= 3 && data[0] == 0 && data[1] == 0 && data[2] == 1 {
+		return true
+	}
+	return false
+}
+
+// splitNALUs splits Annex B byte stream into individual NAL units (without start codes).
+func splitNALUs(data []byte) [][]byte {
+	var nalus [][]byte
+	i := 0
+	for i < len(data) {
+		// find start code
+		scLen := 0
+		if i+4 <= len(data) && data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1 {
+			scLen = 4
+		} else if i+3 <= len(data) && data[i] == 0 && data[i+1] == 0 && data[i+2] == 1 {
+			scLen = 3
+		} else {
+			i++
+			continue
+		}
+		naluStart := i + scLen
+		// find next start code or end
+		j := naluStart
+		for j < len(data) {
+			if j+4 <= len(data) && data[j] == 0 && data[j+1] == 0 && data[j+2] == 0 && data[j+3] == 1 {
+				break
+			}
+			if j+3 <= len(data) && data[j] == 0 && data[j+1] == 0 && data[j+2] == 1 {
+				break
+			}
+			j++
+		}
+		// trim trailing zeros that belong to the next start code
+		end := j
+		for end > naluStart && data[end-1] == 0 {
+			end--
+		}
+		if end > naluStart {
+			nalus = append(nalus, data[naluStart:end])
+		}
+		i = j
+	}
+	return nalus
+}
+
+// annexBToMP4 converts Annex B data to length-prefixed NALUs (4-byte lengths).
+func annexBToMP4(data []byte) []byte {
+	if !isAnnexB(data) {
+		return data
+	}
+	nalus := splitNALUs(data)
+	size := 0
+	for _, n := range nalus {
+		size += 4 + len(n)
+	}
+	out := make([]byte, 0, size)
+	for _, n := range nalus {
+		out = binary.BigEndian.AppendUint32(out, uint32(len(n)))
+		out = append(out, n...)
+	}
+	return out
+}
+
+// buildAvcC builds an AVCDecoderConfigurationRecord from Annex B extradata containing SPS/PPS.
+func buildAvcC(extradata []byte) []byte {
+	if !isAnnexB(extradata) {
+		return extradata // already in AVCC format
+	}
+	nalus := splitNALUs(extradata)
+	var sps, pps [][]byte
+	for _, n := range nalus {
+		if len(n) == 0 {
+			continue
+		}
+		naluType := n[0] & 0x1F
+		switch naluType {
+		case 7: // SPS
+			sps = append(sps, n)
+		case 8: // PPS
+			pps = append(pps, n)
+		}
+	}
+	if len(sps) == 0 {
+		return extradata
+	}
+	// AVCDecoderConfigurationRecord
+	s := sps[0]
+	profileIdc := s[1]
+	profileCompat := s[2]
+	levelIdc := s[3]
+
+	var b []byte
+	b = append(b, 1)           // configurationVersion
+	b = append(b, profileIdc)  // AVCProfileIndication
+	b = append(b, profileCompat)
+	b = append(b, levelIdc)    // AVCLevelIndication
+	b = append(b, 0xFF)        // lengthSizeMinusOne=3 (4 bytes) + reserved
+	b = append(b, 0xE0|byte(len(sps))) // numSPS + reserved
+	for _, s := range sps {
+		b = binary.BigEndian.AppendUint16(b, uint16(len(s)))
+		b = append(b, s...)
+	}
+	b = append(b, byte(len(pps)))
+	for _, p := range pps {
+		b = binary.BigEndian.AppendUint16(b, uint16(len(p)))
+		b = append(b, p...)
+	}
+	return b
+}
+
+// buildHvcC builds an HEVCDecoderConfigurationRecord from Annex B extradata containing VPS/SPS/PPS.
+func buildHvcC(extradata []byte) []byte {
+	if !isAnnexB(extradata) {
+		return extradata // already in HVCC format
+	}
+	nalus := splitNALUs(extradata)
+	type naluArray struct {
+		naluType byte
+		nalus    [][]byte
+	}
+	var vps, sps, pps naluArray
+	vps.naluType = 32
+	sps.naluType = 33
+	pps.naluType = 34
+	for _, n := range nalus {
+		if len(n) < 2 {
+			continue
+		}
+		t := (n[0] >> 1) & 0x3F // HEVC NALU type
+		switch t {
+		case 32:
+			vps.nalus = append(vps.nalus, n)
+		case 33:
+			sps.nalus = append(sps.nalus, n)
+		case 34:
+			pps.nalus = append(pps.nalus, n)
+		}
+	}
+	if len(sps.nalus) == 0 {
+		return extradata
+	}
+
+	// Parse SPS for profile/level info (HEVC SPS starts after 2-byte NALU header)
+	s := sps.nalus[0]
+	// SPS: nalu_header(2) + sps_video_parameter_set_id(4b) + sps_max_sub_layers_minus1(3b) + temporal_id_nesting_flag(1b)
+	// then profile_tier_level structure
+	maxSubLayers := ((s[2] >> 1) & 0x07) + 1
+	temporalIdNested := s[2] & 0x01
+
+	// profile_tier_level starts at byte offset 2 + 1 = 3 in the SPS NALU (after nalu header + first byte)
+	// Actually: nalu_header is 2 bytes, then vps_id(4b)+max_sub_layers(3b)+temporal_nesting(1b) = 1 byte
+	// So profile_tier_level starts at offset 3
+	ptl := s[3:] // profile_tier_level
+	if len(ptl) < 12 {
+		return extradata
+	}
+	generalProfileSpace := ptl[0] >> 6
+	generalTierFlag := (ptl[0] >> 5) & 1
+	generalProfileIdc := ptl[0] & 0x1F
+	generalProfileCompatFlags := binary.BigEndian.Uint32(ptl[1:5])
+	generalConstraintFlags := make([]byte, 6)
+	copy(generalConstraintFlags, ptl[5:11])
+	generalLevelIdc := ptl[11]
+
+	var b []byte
+	b = append(b, 1) // configurationVersion
+	b = append(b, (generalProfileSpace<<6)|(generalTierFlag<<5)|generalProfileIdc)
+	b = binary.BigEndian.AppendUint32(b, generalProfileCompatFlags)
+	b = append(b, generalConstraintFlags...)
+	b = append(b, generalLevelIdc)
+	b = binary.BigEndian.AppendUint16(b, 0xF000) // min_spatial_segmentation_idc = 0 + reserved
+	b = append(b, 0xFC)                           // parallelismType = 0 + reserved
+	b = append(b, 0xFC)                           // chromaFormat = 0 + reserved (could parse from SPS but 0 is safe)
+	b = append(b, 0xF8)                           // bitDepthLumaMinus8 = 0 + reserved
+	b = append(b, 0xF8)                           // bitDepthChromaMinus8 = 0 + reserved
+	b = binary.BigEndian.AppendUint16(b, 0)       // avgFrameRate = 0
+	b = append(b, (0<<6)|(maxSubLayers<<3)|(temporalIdNested<<2)|3) // constantFrameRate=0, lengthSizeMinusOne=3
+
+	var arrays []naluArray
+	if len(vps.nalus) > 0 {
+		arrays = append(arrays, vps)
+	}
+	arrays = append(arrays, sps)
+	if len(pps.nalus) > 0 {
+		arrays = append(arrays, pps)
+	}
+	b = append(b, byte(len(arrays)))
+	for _, a := range arrays {
+		b = append(b, 0x80|a.naluType) // array_completeness=1
+		b = binary.BigEndian.AppendUint16(b, uint16(len(a.nalus)))
+		for _, n := range a.nalus {
+			b = binary.BigEndian.AppendUint16(b, uint16(len(n)))
+			b = append(b, n...)
+		}
+	}
+	return b
+}
+
 func mp4Stsd(si streamInfo) []byte {
 	var entry []byte
 	switch si.codecID {
 	case avCodecH264:
-		entry = videoEntry("avc1", si, bx("avcC", si.extradata))
+		entry = videoEntry("avc1", si, bx("avcC", buildAvcC(si.extradata)))
 	case avCodecHEVC:
-		entry = videoEntry("hvc1", si, bx("hvcC", si.extradata))
+		entry = videoEntry("hvc1", si, bx("hvcC", buildHvcC(si.extradata)))
 	case avCodecVP8:
 		entry = videoEntry("vp08", si, bx("vpcC", si.extradata))
 	case avCodecVP9:
