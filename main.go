@@ -60,6 +60,8 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -409,10 +411,50 @@ func writeResponse(w io.Writer, status byte) error {
 	return err
 }
 
+// --- recorder ---
+
+type recorder struct {
+	cmd      *exec.Cmd
+	stdin    io.WriteCloser
+	filename string
+}
+
+func newRecorder(dir, streamPath string) (*recorder, error) {
+	ts := time.Now().Format("20060102_150405")
+	name := strings.TrimPrefix(streamPath, "/")
+	name = strings.ReplaceAll(name, "/", "_")
+	filename := filepath.Join(dir, fmt.Sprintf("recording_%s_%s.mp4", name, ts))
+
+	cmd := exec.Command("ffmpeg",
+		"-f", "smp", "-i", "pipe:0",
+		"-c", "copy",
+		"-movflags", "+faststart",
+		"-y", filename)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		stdin.Close()
+		return nil, err
+	}
+	return &recorder{cmd: cmd, stdin: stdin, filename: filename}, nil
+}
+
+func (r *recorder) write(m *message) {
+	r.stdin.Write(m.framed)
+}
+
+func (r *recorder) stop() {
+	r.stdin.Close()
+	r.cmd.Wait()
+}
+
 // --- server ---
 
 type server struct {
-	hub *hub
+	hub       *hub
+	recordDir string
 }
 
 func (srv *server) handle(conn net.Conn) {
@@ -470,6 +512,14 @@ func (srv *server) servePush(conn net.Conn, s *stream, peer string, seamless boo
 	var packets uint64
 	var keyframes uint64
 	var bytes uint64
+	var rec *recorder
+
+	defer func() {
+		if rec != nil {
+			rec.stop()
+			logger.Info("recording stopped", "file", rec.filename)
+		}
+	}()
 
 	for {
 		m, err := readMessage(conn)
@@ -496,6 +546,17 @@ func (srv *server) servePush(conn net.Conn, s *stream, peer string, seamless boo
 				logger.Debug("header unchanged on reconnect", "peer", peer, "path", s.path)
 			}
 			first = false
+
+			if srv.recordDir != "" {
+				var err error
+				rec, err = newRecorder(srv.recordDir, s.path)
+				if err != nil {
+					logger.Warn("recording failed to start", "path", s.path, "err", err)
+				} else {
+					rec.write(m)
+					logger.Info("recording started", "file", rec.filename)
+				}
+			}
 			continue
 		}
 
@@ -515,6 +576,10 @@ func (srv *server) servePush(conn net.Conn, s *stream, peer string, seamless boo
 		default:
 			logger.Warn("unknown message type",
 				"peer", peer, "path", s.path, "type", fmt.Sprintf("0x%02x", m.mtype))
+		}
+
+		if rec != nil {
+			rec.write(m)
 		}
 	}
 }
@@ -574,6 +639,7 @@ func modeName(m byte) string {
 func main() {
 	addr := flag.String("addr", ":7777", "listen address")
 	logLvl := flag.String("log", "info", "log level (debug|info|warn|error)")
+	recordDir := flag.String("record", "", "directory to save recordings (empty=disabled)")
 	flag.Parse()
 
 	lvl, err := parseLevel(*logLvl)
@@ -588,7 +654,14 @@ func main() {
 	}
 	logger.Info("smp listening", "addr", ln.Addr().String(), "level", *logLvl)
 
-	srv := &server{hub: newHub()}
+	if *recordDir != "" {
+		if err := os.MkdirAll(*recordDir, 0755); err != nil {
+			logger.Fatal("cannot create record dir", "dir", *recordDir, "err", err)
+		}
+		logger.Info("recording enabled", "dir", *recordDir)
+	}
+
+	srv := &server{hub: newHub(), recordDir: *recordDir}
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
