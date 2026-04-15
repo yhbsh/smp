@@ -99,7 +99,7 @@ func New(cfg Config) *Server {
 		cfg.Addr = ":7777"
 	}
 	if cfg.RecordDir == "" {
-		cfg.RecordDir = "recordings"
+		cfg.RecordDir = "."
 	}
 	logger.SetLevel(cfg.LogLevel)
 	os.MkdirAll(cfg.RecordDir, 0755)
@@ -120,12 +120,12 @@ func New(cfg Config) *Server {
 	}
 }
 
-func (s *Server) ListenAndServe() error {
+func (s *Server) Run() error {
 	ln, err := net.Listen("tcp", s.cfg.Addr)
 	if err != nil {
 		return err
 	}
-	logger.Info("smp listening", "addr", ln.Addr().String())
+	logger.Info("listening", "addr", s.cfg.Addr, "proto", "smp")
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -1343,7 +1343,7 @@ func (srv *server) servePush(conn net.Conn, s *stream, peer string, seamless boo
 					return
 				}
 				logger.Info("auto-record finalized", "path", s.path, "file", merged)
-				s3Key := "recordings/" + filepath.Base(merged)
+				s3Key := "clips/" + filepath.Base(merged)
 				s3Path, err := uploadToS3(merged, s3Key, srv.tm.aws)
 				if err != nil {
 					logger.Error("auto-record upload failed", "file", merged, "err", err)
@@ -1697,7 +1697,7 @@ stop:
 	tm.mu.Unlock()
 	logger.Info("recording stopped, uploading", "task", task.ID, "file", task.Filename)
 
-	s3Key := "recordings/" + filepath.Base(task.Filename)
+	s3Key := "clips/" + filepath.Base(task.Filename)
 	s3Path, err := uploadToS3(task.Filename, s3Key, tm.aws)
 
 	tm.mu.Lock()
@@ -1789,4 +1789,3 @@ func hmacSHA256(key, data []byte) []byte {
 	h.Write(data)
 	return h.Sum(nil)
 }
-

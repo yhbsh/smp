@@ -27,5 +27,5 @@ func main() {
 		log.Fatal(http.ListenAndServe(":7778", mux))
 	}()
 
-	log.Fatal(s.ListenAndServe())
+	log.Fatal(s.Run())
 }
