@@ -941,7 +941,7 @@ func buildMoov(allTracks []trackState) []byte {
 			continue
 		}
 		si := t.info
-		if si.codecID != avCodecH264 && si.codecID != avCodecAAC {
+		if si.codecID != avCodecH264 && si.codecID != avCodecHEVC && si.codecID != avCodecAAC {
 			logger.Debug("skipping unsupported codec in mp4 mux", "codec_id", si.codecID, "type", si.codecType)
 			continue
 		}
