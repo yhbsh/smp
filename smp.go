@@ -49,7 +49,7 @@
 //   ffmpeg -re -i input.mp4 -c copy -f smp smp://host:7777/live
 //   ffplay -f smp smp://host:7777/live
 
-package main
+package smp
 
 import (
 	"crypto/hmac"
@@ -59,7 +59,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -71,6 +70,80 @@ import (
 	"sync"
 	"time"
 )
+
+// --- public API ---
+
+type AWSConfig struct {
+	Bucket    string
+	Region    string
+	AccessKey string
+	SecretKey string
+}
+
+type Config struct {
+	Addr      string   // TCP relay address, default ":7777"
+	RecordDir string   // segment/clip directory, default "recordings"
+	LogLevel  LogLevel // default InfoLevel
+	AWS       AWSConfig
+}
+
+type Server struct {
+	cfg Config
+	hub *hub
+	tm  *taskManager
+	rel *server
+}
+
+func New(cfg Config) *Server {
+	if cfg.Addr == "" {
+		cfg.Addr = ":7777"
+	}
+	if cfg.RecordDir == "" {
+		cfg.RecordDir = "recordings"
+	}
+	logger.SetLevel(cfg.LogLevel)
+	os.MkdirAll(cfg.RecordDir, 0755)
+
+	h := newHub()
+	tm := &taskManager{
+		tasks:    make(map[string]*recordTask),
+		autoRecs: make(map[string]*segRecorder),
+		hub:      h,
+		dir:      cfg.RecordDir,
+		aws:      cfg.AWS,
+	}
+	return &Server{
+		cfg: cfg,
+		hub: h,
+		tm:  tm,
+		rel: &server{hub: h, dir: cfg.RecordDir, tm: tm},
+	}
+}
+
+func (s *Server) ListenAndServe() error {
+	ln, err := net.Listen("tcp", s.cfg.Addr)
+	if err != nil {
+		return err
+	}
+	logger.Info("smp listening", "addr", ln.Addr().String())
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			logger.Error("accept failed", "err", err)
+			continue
+		}
+		go s.rel.handle(conn)
+	}
+}
+
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/record/start", s.tm.handleStart)
+	mux.HandleFunc("/record/stop", s.tm.handleStop)
+	mux.HandleFunc("/record/tasks", s.tm.handleTasks)
+	mux.HandleFunc("/record/clip", s.tm.handleClip)
+	return mux
+}
 
 // --- protocol constants ---
 
@@ -97,10 +170,10 @@ const (
 
 // --- logger (mirrors livsho/backend conventions) ---
 
-type logLevel int
+type LogLevel int
 
 const (
-	DebugLevel logLevel = iota
+	DebugLevel LogLevel = iota
 	InfoLevel
 	WarnLevel
 	ErrorLevel
@@ -118,18 +191,18 @@ const (
 type Logger struct {
 	mu    sync.Mutex
 	out   io.Writer
-	level logLevel
+	level LogLevel
 }
 
 var logger = &Logger{out: os.Stderr, level: InfoLevel}
 
-func (l *Logger) SetLevel(lvl logLevel) {
+func (l *Logger) SetLevel(lvl LogLevel) {
 	l.mu.Lock()
 	l.level = lvl
 	l.mu.Unlock()
 }
 
-func (l *Logger) write(lvl logLevel, color, label, msg string, args ...any) {
+func (l *Logger) write(lvl LogLevel, color, label, msg string, args ...any) {
 	if lvl < l.level {
 		return
 	}
@@ -153,7 +226,7 @@ func (l *Logger) Fatal(msg any, args ...any) {
 	os.Exit(1)
 }
 
-func parseLevel(s string) (logLevel, error) {
+func parseLevel(s string) (LogLevel, error) {
 	switch strings.ToLower(s) {
 	case "debug":
 		return DebugLevel, nil
@@ -1273,12 +1346,12 @@ func (srv *server) servePush(conn net.Conn, s *stream, peer string, seamless boo
 				}
 				logger.Info("auto-record finalized", "path", s.path, "file", merged)
 				s3Key := "recordings/" + filepath.Base(merged)
-				s3URL, err := uploadToS3(merged, s3Key)
+				s3Path, err := uploadToS3(merged, s3Key, srv.tm.aws)
 				if err != nil {
 					logger.Error("auto-record upload failed", "file", merged, "err", err)
-				} else {
+				} else if srv.tm.aws.Bucket != "" {
 					os.Remove(merged)
-					logger.Info("auto-record uploaded", "url", s3URL)
+					logger.Info("auto-record uploaded", "path", s3Path)
 				}
 			}()
 		}
@@ -1428,6 +1501,7 @@ type taskManager struct {
 	autoRecs map[string]*segRecorder
 	hub      *hub
 	dir      string
+	aws      AWSConfig
 }
 
 func randomID() string {
@@ -1583,16 +1657,18 @@ func (tm *taskManager) handleClip(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s3Key := "clips/" + filepath.Base(clipPath)
-	s3URL, err := uploadToS3(clipPath, s3Key)
-	os.Remove(clipPath)
+	s3Path, err := uploadToS3(clipPath, s3Key, tm.aws)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), 500)
 		return
 	}
+	if tm.aws.Bucket != "" {
+		os.Remove(clipPath)
+	}
 
-	logger.Info("clip created", "path", req.Path, "seconds", req.Seconds, "url", s3URL)
+	logger.Info("clip created", "path", req.Path, "seconds", req.Seconds, "s3", s3Path)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"s3_path": s3URL})
+	json.NewEncoder(w).Encode(map[string]string{"s3_path": s3Path})
 }
 
 func (tm *taskManager) recordLoop(task *recordTask, maxDur time.Duration) {
@@ -1624,7 +1700,7 @@ stop:
 	logger.Info("recording stopped, uploading", "task", task.ID, "file", task.Filename)
 
 	s3Key := "recordings/" + filepath.Base(task.Filename)
-	s3URL, err := uploadToS3(task.Filename, s3Key)
+	s3Path, err := uploadToS3(task.Filename, s3Key, tm.aws)
 
 	tm.mu.Lock()
 	if err != nil {
@@ -1633,28 +1709,21 @@ stop:
 		logger.Error("s3 upload failed", "task", task.ID, "err", err)
 	} else {
 		task.State = stateDone
-		task.S3Path = s3URL
-		os.Remove(task.Filename)
-		logger.Info("recording uploaded", "task", task.ID, "url", s3URL)
+		task.S3Path = s3Path
+		if tm.aws.Bucket != "" {
+			os.Remove(task.Filename)
+		}
+		logger.Info("recording uploaded", "task", task.ID, "path", s3Path)
 	}
 	tm.mu.Unlock()
 }
 
-func (tm *taskManager) serve(addr string) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/record/start", tm.handleStart)
-	mux.HandleFunc("/record/stop", tm.handleStop)
-	mux.HandleFunc("/record/tasks", tm.handleTasks)
-	mux.HandleFunc("/record/clip", tm.handleClip)
-	logger.Info("api listening", "addr", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		logger.Fatal("api listen failed", "err", err)
-	}
-}
-
 // --- s3 upload ---
 
-func uploadToS3(filePath, s3Key string) (string, error) {
+func uploadToS3(filePath, s3Key string, aws AWSConfig) (string, error) {
+	if aws.Bucket == "" {
+		return s3Key, nil
+	}
 	f, err := os.Open(filePath)
 	if err != nil {
 		return "", err
@@ -1670,7 +1739,7 @@ func uploadToS3(filePath, s3Key string) (string, error) {
 	date := now.Format("20060102")
 	datetime := now.Format("20060102T150405Z")
 
-	host := fmt.Sprintf("%s.s3.%s.amazonaws.com", awsBucket, awsRegion)
+	host := fmt.Sprintf("%s.s3.%s.amazonaws.com", aws.Bucket, aws.Region)
 	endpoint := fmt.Sprintf("https://%s/%s", host, s3Key)
 
 	ct := "application/octet-stream"
@@ -1683,18 +1752,18 @@ func uploadToS3(filePath, s3Key string) (string, error) {
 	signedHeaders := "content-type;host;x-amz-content-sha256;x-amz-date"
 	canonicalRequest := fmt.Sprintf("PUT\n/%s\n\n%s\n%s\nUNSIGNED-PAYLOAD", s3Key, canonicalHeaders, signedHeaders)
 
-	scope := fmt.Sprintf("%s/%s/s3/aws4_request", date, awsRegion)
+	scope := fmt.Sprintf("%s/%s/s3/aws4_request", date, aws.Region)
 	hash := sha256.Sum256([]byte(canonicalRequest))
 	stringToSign := fmt.Sprintf("AWS4-HMAC-SHA256\n%s\n%s\n%s", datetime, scope, hex.EncodeToString(hash[:]))
 
-	kDate := hmacSHA256([]byte("AWS4"+awsSecretKey), []byte(date))
-	kRegion := hmacSHA256(kDate, []byte(awsRegion))
+	kDate := hmacSHA256([]byte("AWS4"+aws.SecretKey), []byte(date))
+	kRegion := hmacSHA256(kDate, []byte(aws.Region))
 	kService := hmacSHA256(kRegion, []byte("s3"))
 	kSigning := hmacSHA256(kService, []byte("aws4_request"))
 	sig := hex.EncodeToString(hmacSHA256(kSigning, []byte(stringToSign)))
 
 	auth := fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
-		awsAccessKeyID, scope, signedHeaders, sig)
+		aws.AccessKey, scope, signedHeaders, sig)
 
 	req, _ := http.NewRequest("PUT", endpoint, f)
 	req.ContentLength = stat.Size()
@@ -1723,40 +1792,3 @@ func hmacSHA256(key, data []byte) []byte {
 	return h.Sum(nil)
 }
 
-// --- main ---
-
-func main() {
-	addr := flag.String("addr", ":7777", "listen address")
-	apiAddr := flag.String("api", ":7778", "HTTP API address for recording control")
-	logLvl := flag.String("log", "info", "log level (debug|info|warn|error)")
-	flag.Parse()
-
-	lvl, err := parseLevel(*logLvl)
-	if err != nil {
-		logger.Fatal(err)
-	}
-	logger.SetLevel(lvl)
-
-	ln, err := net.Listen("tcp", *addr)
-	if err != nil {
-		logger.Fatal("listen failed", "addr", *addr, "err", err)
-	}
-	logger.Info("smp listening", "addr", ln.Addr().String(), "level", *logLvl)
-
-	h := newHub()
-
-	dir := "recordings"
-	os.MkdirAll(dir, 0755)
-	tm := &taskManager{tasks: make(map[string]*recordTask), autoRecs: make(map[string]*segRecorder), hub: h, dir: dir}
-	go tm.serve(*apiAddr)
-
-	srv := &server{hub: h, dir: dir, tm: tm}
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			logger.Error("accept failed", "err", err)
-			continue
-		}
-		go srv.handle(conn)
-	}
-}
