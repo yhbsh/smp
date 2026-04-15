@@ -923,6 +923,7 @@ const segDuration = 10 * time.Second
 type segmentInfo struct {
 	filename string
 	created  time.Time
+	ended    time.Time
 	tracks   []trackState
 }
 
@@ -984,6 +985,7 @@ func (sr *segRecorder) cutSegment() {
 	sr.segments = append(sr.segments, segmentInfo{
 		filename: sr.current.f.Name(),
 		created:  sr.curStart,
+		ended:    time.Now(),
 		tracks:   tracks,
 	})
 	sr.current.stopRaw()
@@ -1021,7 +1023,7 @@ func (sr *segRecorder) finalize() (string, error) {
 	name := strings.ReplaceAll(strings.TrimPrefix(sr.path, "/"), "/", "_")
 	out := filepath.Join(sr.dir, "recording_"+name+"_"+ts+".mp4")
 
-	if err := mergeSegments(segs, out); err != nil {
+	if err := mergeSegments(segs, out, time.Time{}); err != nil {
 		return "", err
 	}
 	for _, seg := range segs {
@@ -1036,7 +1038,7 @@ func (sr *segRecorder) clip(seconds float64) (string, error) {
 	cutoff := time.Now().Add(-time.Duration(seconds * float64(time.Second)))
 	var clipSegs []segmentInfo
 	for _, seg := range sr.segments {
-		if seg.created.Add(segDuration).After(cutoff) {
+		if seg.ended.After(cutoff) {
 			clipSegs = append(clipSegs, seg)
 		}
 	}
@@ -1050,7 +1052,7 @@ func (sr *segRecorder) clip(seconds float64) (string, error) {
 	name := strings.ReplaceAll(strings.TrimPrefix(sr.path, "/"), "/", "_")
 	out := filepath.Join(sr.dir, "clip_"+name+"_"+ts+".mp4")
 
-	if err := mergeSegments(clipSegs, out); err != nil {
+	if err := mergeSegments(clipSegs, out, cutoff); err != nil {
 		return "", err
 	}
 	return out, nil
@@ -1059,12 +1061,40 @@ func (sr *segRecorder) clip(seconds float64) (string, error) {
 // mergeSegments combines multiple segment files into one faststart MP4.
 // Segment files have layout: ftyp(32) | mdat(8+data) | moov.
 // Sample offsets in trackState point into the segment file (data starts at 40).
-func mergeSegments(segs []segmentInfo, outPath string) error {
+// If trimAfter is non-zero, samples before the nearest preceding video keyframe
+// are excluded from the sample tables (data is still copied but unreferenced).
+func mergeSegments(segs []segmentInfo, outPath string, trimAfter time.Time) error {
 	if len(segs) == 0 {
 		return errors.New("no segments")
 	}
 
-	// Compute data length per segment and build merged tracks.
+	trim := !trimAfter.IsZero()
+	var trimWall time.Time
+
+	if trim {
+		// Find the latest video keyframe at or before trimAfter for a clean start.
+		for _, seg := range segs {
+			for _, t := range seg.tracks {
+				if t.info.codecType != avMediaVideo || len(t.samples) == 0 {
+					continue
+				}
+				firstDTS := t.samples[0].dts
+				for _, s := range t.samples {
+					if !s.key {
+						continue
+					}
+					wt := sampleWallTime(seg.created, firstDTS, s.dts, t.info)
+					if !wt.After(trimAfter) && wt.After(trimWall) {
+						trimWall = wt
+					}
+				}
+			}
+		}
+		if trimWall.IsZero() {
+			trim = false // no keyframe before cutoff, include everything
+		}
+	}
+
 	merged := make([]trackState, len(segs[0].tracks))
 	for i := range merged {
 		merged[i].info = segs[0].tracks[i].info
@@ -1090,9 +1120,19 @@ func mergeSegments(segs []segmentInfo, outPath string) error {
 		ranges[si] = segRange{start: totalData, length: dataLen}
 
 		for ti, t := range seg.tracks {
+			if len(t.samples) == 0 {
+				continue
+			}
+			firstDTS := t.samples[0].dts
 			for _, s := range t.samples {
+				if trim {
+					wt := sampleWallTime(seg.created, firstDTS, s.dts, t.info)
+					if wt.Before(trimWall) {
+						continue
+					}
+				}
 				merged[ti].samples = append(merged[ti].samples, sampleMeta{
-					offset: totalData + (s.offset - 40), // relative to merged mdat start
+					offset: totalData + (s.offset - 40),
 					size:   s.size,
 					dts:    s.dts,
 					pts:    s.pts,
@@ -1115,7 +1155,7 @@ func mergeSegments(segs []segmentInfo, outPath string) error {
 	// Build moov to learn its size, then shift offsets for faststart.
 	moov := buildMoov(merged)
 	moovSize := int64(len(moov))
-	base := int64(len(mp4Ftyp())) + moovSize + 8 // ftyp + moov + mdat header
+	base := int64(len(mp4Ftyp())) + moovSize + 8
 	for ti := range merged {
 		for j := range merged[ti].samples {
 			merged[ti].samples[j].offset += base
@@ -1123,7 +1163,6 @@ func mergeSegments(segs []segmentInfo, outPath string) error {
 	}
 	moov = buildMoov(merged)
 
-	// Write output file: ftyp | moov | mdat header | data from each segment.
 	out, err := os.Create(outPath)
 	if err != nil {
 		return err
@@ -1148,6 +1187,11 @@ func mergeSegments(segs []segmentInfo, outPath string) error {
 		f.Close()
 	}
 	return nil
+}
+
+func sampleWallTime(segCreated time.Time, firstDTS, sampleDTS int64, info streamInfo) time.Time {
+	delta := float64(sampleDTS-firstDTS) * float64(info.tbNum) / float64(info.tbDen)
+	return segCreated.Add(time.Duration(delta * float64(time.Second)))
 }
 
 // --- server ---
