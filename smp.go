@@ -1184,6 +1184,13 @@ func buildMoov(allTracks []trackState) []byte {
 			logger.Debug("skipping unsupported codec in mp4 mux", "codec_id", si.codecID, "type", si.codecType)
 			continue
 		}
+		// Recompute sample durations from DTS deltas — pkt->duration from
+		// FFmpeg is unreliable for variable-framerate sources (e.g. mobile
+		// cameras report duration=1 regardless of actual frame interval).
+		for j := 0; j+1 < len(t.samples); j++ {
+			t.samples[j].dur = t.samples[j+1].dts - t.samples[j].dts
+		}
+
 		ts := si.tbDen
 		first, last := t.samples[0], t.samples[len(t.samples)-1]
 		durTS := uint32(last.dts + last.dur - first.dts)
