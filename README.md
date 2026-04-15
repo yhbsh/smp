@@ -42,7 +42,9 @@ go http.ListenAndServe(":7778", mux)
 log.Fatal(s.Run())
 ```
 
-### Push and pull with FFmpeg
+### Push and pull with [FFmpeg](https://github.com/yhbsh/ffmpeg)
+
+Requires the [SMP-enabled FFmpeg fork](https://github.com/yhbsh/ffmpeg) which implements the SMP protocol and format.
 
 ```
 ffmpeg -re -i input.mp4 -c copy -f smp smp://localhost:7777/live
