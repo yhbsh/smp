@@ -498,6 +498,7 @@ type recorder interface {
 
 const (
 	avCodecH264  = 27
+	avCodecHEVC  = 173
 	avCodecAAC   = 86018
 	avMediaVideo = 0
 	avMediaAudio = 1
@@ -552,7 +553,7 @@ func parseHeader(m *message) ([]streamInfo, error) {
 
 func canRecord(streams []streamInfo) bool {
 	for _, si := range streams {
-		if si.codecID == avCodecH264 || si.codecID == avCodecAAC {
+		if si.codecID == avCodecH264 || si.codecID == avCodecHEVC || si.codecID == avCodecAAC {
 			return true
 		}
 	}
@@ -805,6 +806,19 @@ func mp4Avc1(si streamInfo) []byte {
 	return bx("avc1", b, bx("avcC", si.extradata))
 }
 
+func mp4Hvc1(si streamInfo) []byte {
+	b := make([]byte, 78)
+	binary.BigEndian.PutUint16(b[6:], 1)
+	binary.BigEndian.PutUint16(b[24:], uint16(si.width))
+	binary.BigEndian.PutUint16(b[26:], uint16(si.height))
+	binary.BigEndian.PutUint32(b[28:], 0x00480000)
+	binary.BigEndian.PutUint32(b[32:], 0x00480000)
+	binary.BigEndian.PutUint16(b[40:], 1)
+	binary.BigEndian.PutUint16(b[74:], 0x0018)
+	binary.BigEndian.PutUint16(b[76:], 0xFFFF)
+	return bx("hvc1", b, bx("hvcC", si.extradata))
+}
+
 func mp4Esds(asc []byte) []byte {
 	dsi := append([]byte{0x05, byte(len(asc))}, asc...)
 	dcd := append([]byte{0x04, byte(13 + len(dsi)),
@@ -832,6 +846,8 @@ func mp4Stsd(si streamInfo) []byte {
 	switch si.codecID {
 	case avCodecH264:
 		entry = mp4Avc1(si)
+	case avCodecHEVC:
+		entry = mp4Hvc1(si)
 	case avCodecAAC:
 		entry = mp4Mp4a(si)
 	default:
