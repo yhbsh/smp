@@ -1036,7 +1036,7 @@ func (sr *segRecorder) clip(seconds float64) (string, error) {
 	cutoff := time.Now().Add(-time.Duration(seconds * float64(time.Second)))
 	var clipSegs []segmentInfo
 	for _, seg := range sr.segments {
-		if seg.created.After(cutoff) {
+		if seg.created.Add(segDuration).After(cutoff) {
 			clipSegs = append(clipSegs, seg)
 		}
 	}
