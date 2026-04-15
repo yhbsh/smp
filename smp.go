@@ -82,7 +82,6 @@ type AWSConfig struct {
 
 type Config struct {
 	Addr      string   // TCP relay address, default ":7777"
-	APIAddr   string   // HTTP API address, default ":7778"
 	RecordDir string   // segment/clip directory, default "recordings"
 	LogLevel  LogLevel // default InfoLevel
 	AWS       AWSConfig
@@ -98,9 +97,6 @@ type Server struct {
 func New(cfg Config) *Server {
 	if cfg.Addr == "" {
 		cfg.Addr = ":7777"
-	}
-	if cfg.APIAddr == "" {
-		cfg.APIAddr = ":7778"
 	}
 	if cfg.RecordDir == "" {
 		cfg.RecordDir = "recordings"
@@ -130,14 +126,6 @@ func (s *Server) ListenAndServe() error {
 		return err
 	}
 	logger.Info("smp listening", "addr", ln.Addr().String())
-
-	go func() {
-		logger.Info("api listening", "addr", s.cfg.APIAddr)
-		if err := http.ListenAndServe(s.cfg.APIAddr, s.Handler()); err != nil {
-			logger.Fatal("api listen failed", "err", err)
-		}
-	}()
-
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -148,13 +136,11 @@ func (s *Server) ListenAndServe() error {
 	}
 }
 
-func (s *Server) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/smp/start", s.tm.handleStart)
-	mux.HandleFunc("/smp/stop", s.tm.handleStop)
-	mux.HandleFunc("/smp/tasks", s.tm.handleTasks)
-	mux.HandleFunc("/smp/clip", s.tm.handleClip)
-	return mux
+func (s *Server) Register(mux *http.ServeMux, base string) {
+	mux.HandleFunc(base+"/start", s.tm.handleStart)
+	mux.HandleFunc(base+"/stop", s.tm.handleStop)
+	mux.HandleFunc(base+"/tasks", s.tm.handleTasks)
+	mux.HandleFunc(base+"/clip", s.tm.handleClip)
 }
 
 // --- protocol constants ---
