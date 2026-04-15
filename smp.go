@@ -1342,14 +1342,15 @@ func (srv *server) servePush(conn net.Conn, s *stream, peer string, seamless boo
 					logger.Error("auto-record finalize failed", "path", s.path, "err", err)
 					return
 				}
-				logger.Info("auto-record finalized", "path", s.path, "file", merged)
+				size := fmtSize(merged)
+				logger.Info("auto-record finalized", "path", s.path, "file", merged, "size", size)
 				s3Key := "clips/" + filepath.Base(merged)
 				s3Path, err := uploadToS3(merged, s3Key, srv.tm.aws)
 				if err != nil {
-					logger.Error("auto-record upload failed", "file", merged, "err", err)
+					logger.Error("auto-record upload failed", "file", merged, "size", size, "err", err)
 				} else if srv.tm.aws.Bucket != "" {
 					os.Remove(merged)
-					logger.Info("auto-record uploaded", "path", s3Path)
+					logger.Info("auto-record uploaded", "path", s3Path, "size", size)
 				}
 			}()
 		}
@@ -1654,6 +1655,7 @@ func (tm *taskManager) handleClip(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	clipSize := fmtSize(clipPath)
 	s3Key := "clips/" + filepath.Base(clipPath)
 	s3Path, err := uploadToS3(clipPath, s3Key, tm.aws)
 	if err != nil {
@@ -1664,7 +1666,7 @@ func (tm *taskManager) handleClip(w http.ResponseWriter, r *http.Request) {
 		os.Remove(clipPath)
 	}
 
-	logger.Info("clip created", "path", req.Path, "seconds", req.Seconds, "s3", s3Path)
+	logger.Info("clip created", "path", req.Path, "seconds", req.Seconds, "size", clipSize, "s3", s3Path)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"s3_path": s3Path})
 }
@@ -1697,6 +1699,7 @@ stop:
 	tm.mu.Unlock()
 	logger.Info("recording stopped, uploading", "task", task.ID, "file", task.Filename)
 
+	recSize := fmtSize(task.Filename)
 	s3Key := "clips/" + filepath.Base(task.Filename)
 	s3Path, err := uploadToS3(task.Filename, s3Key, tm.aws)
 
@@ -1704,16 +1707,34 @@ stop:
 	if err != nil {
 		task.State = stateFailed
 		task.Error = err.Error()
-		logger.Error("s3 upload failed", "task", task.ID, "err", err)
+		logger.Error("s3 upload failed", "task", task.ID, "size", recSize, "err", err)
 	} else {
 		task.State = stateDone
 		task.S3Path = s3Path
 		if tm.aws.Bucket != "" {
 			os.Remove(task.Filename)
 		}
-		logger.Info("recording uploaded", "task", task.ID, "path", s3Path)
+		logger.Info("recording uploaded", "task", task.ID, "size", recSize, "path", s3Path)
 	}
 	tm.mu.Unlock()
+}
+
+func fmtSize(path string) string {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "?"
+	}
+	b := float64(info.Size())
+	switch {
+	case b >= 1<<30:
+		return fmt.Sprintf("%.1fGB", b/(1<<30))
+	case b >= 1<<20:
+		return fmt.Sprintf("%.1fMB", b/(1<<20))
+	case b >= 1<<10:
+		return fmt.Sprintf("%.1fKB", b/(1<<10))
+	default:
+		return fmt.Sprintf("%dB", int(b))
+	}
 }
 
 // --- s3 upload ---
