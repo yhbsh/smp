@@ -497,9 +497,15 @@ type recorder interface {
 // SMP header/packet parsing for native MP4 muxing.
 
 const (
-	avCodecH264  = 27
-	avCodecHEVC  = 173
-	avCodecAAC   = 86018
+	avCodecH264 = 27
+	avCodecHEVC = 173
+	avCodecVP8  = 139
+	avCodecVP9  = 167
+	avCodecAV1  = 226
+	avCodecAAC  = 86018
+	avCodecMP3  = 86017
+	avCodecOPUS = 86076
+
 	avMediaVideo = 0
 	avMediaAudio = 1
 )
@@ -551,9 +557,18 @@ func parseHeader(m *message) ([]streamInfo, error) {
 	return out, nil
 }
 
+func supportedCodec(id uint32) bool {
+	switch id {
+	case avCodecH264, avCodecHEVC, avCodecVP8, avCodecVP9, avCodecAV1,
+		avCodecAAC, avCodecMP3, avCodecOPUS:
+		return true
+	}
+	return false
+}
+
 func canRecord(streams []streamInfo) bool {
 	for _, si := range streams {
-		if si.codecID == avCodecH264 || si.codecID == avCodecHEVC || si.codecID == avCodecAAC {
+		if supportedCodec(si.codecID) {
 			return true
 		}
 	}
@@ -696,7 +711,7 @@ func newMp4Recorder(filename string, header *message) (*mp4Recorder, error) {
 		return nil, err
 	}
 	if !canRecord(streams) {
-		return nil, fmt.Errorf("no supported codecs (need H.264 or AAC, got codec_ids: %v)", codecIDs(streams))
+		return nil, fmt.Errorf("no supported codecs (got codec_ids: %v)", codecIDs(streams))
 	}
 	f, err := os.Create(filename)
 	if err != nil {
@@ -793,7 +808,8 @@ func mp4Dinf() []byte {
 	return bx("dinf", fbx("dref", 0, 0, u32(1), fbx("url ", 0, 1)))
 }
 
-func mp4Avc1(si streamInfo) []byte {
+// video sample entry: 78-byte VisualSampleEntry + config child box
+func videoEntry(boxType string, si streamInfo, configBox []byte) []byte {
 	b := make([]byte, 78)
 	binary.BigEndian.PutUint16(b[6:], 1)
 	binary.BigEndian.PutUint16(b[24:], uint16(si.width))
@@ -803,26 +819,23 @@ func mp4Avc1(si streamInfo) []byte {
 	binary.BigEndian.PutUint16(b[40:], 1)
 	binary.BigEndian.PutUint16(b[74:], 0x0018)
 	binary.BigEndian.PutUint16(b[76:], 0xFFFF)
-	return bx("avc1", b, bx("avcC", si.extradata))
+	return bx(boxType, b, configBox)
 }
 
-func mp4Hvc1(si streamInfo) []byte {
-	b := make([]byte, 78)
+// audio sample entry: 28-byte AudioSampleEntry + config child box
+func audioEntry(boxType string, si streamInfo, configBox []byte) []byte {
+	b := make([]byte, 28)
 	binary.BigEndian.PutUint16(b[6:], 1)
-	binary.BigEndian.PutUint16(b[24:], uint16(si.width))
-	binary.BigEndian.PutUint16(b[26:], uint16(si.height))
-	binary.BigEndian.PutUint32(b[28:], 0x00480000)
-	binary.BigEndian.PutUint32(b[32:], 0x00480000)
-	binary.BigEndian.PutUint16(b[40:], 1)
-	binary.BigEndian.PutUint16(b[74:], 0x0018)
-	binary.BigEndian.PutUint16(b[76:], 0xFFFF)
-	return bx("hvc1", b, bx("hvcC", si.extradata))
+	binary.BigEndian.PutUint16(b[16:], uint16(si.channels))
+	binary.BigEndian.PutUint16(b[18:], 16)
+	binary.BigEndian.PutUint32(b[24:], si.sampleRate<<16)
+	return bx(boxType, b, configBox)
 }
 
-func mp4Esds(asc []byte) []byte {
+func mp4Esds(objectType byte, asc []byte) []byte {
 	dsi := append([]byte{0x05, byte(len(asc))}, asc...)
 	dcd := append([]byte{0x04, byte(13 + len(dsi)),
-		0x40, 0x15, 0x00, 0x00, 0x00,
+		objectType, 0x15, 0x00, 0x00, 0x00,
 		0x00, 0x00, 0x00, 0x00,
 		0x00, 0x00, 0x00, 0x00,
 	}, dsi...)
@@ -832,24 +845,38 @@ func mp4Esds(asc []byte) []byte {
 	return fbx("esds", 0, 0, es)
 }
 
-func mp4Mp4a(si streamInfo) []byte {
-	b := make([]byte, 28)
-	binary.BigEndian.PutUint16(b[6:], 1)
-	binary.BigEndian.PutUint16(b[16:], uint16(si.channels))
-	binary.BigEndian.PutUint16(b[18:], 16)
-	binary.BigEndian.PutUint32(b[24:], si.sampleRate<<16)
-	return bx("mp4a", b, mp4Esds(si.extradata))
+// dOps box for Opus in MP4 (RFC 7845 mapping)
+func mp4DOps(si streamInfo) []byte {
+	// OpusHead-like structure: version, channels, pre-skip, sample rate, gain, mapping
+	b := make([]byte, 11)
+	b[0] = 0    // version
+	b[1] = byte(si.channels)
+	binary.BigEndian.PutUint16(b[2:], 0)              // pre-skip
+	binary.BigEndian.PutUint32(b[4:], si.sampleRate)   // input sample rate
+	binary.BigEndian.PutUint16(b[8:], 0)               // output gain
+	b[10] = 0   // channel mapping family
+	return bx("dOps", b)
 }
 
 func mp4Stsd(si streamInfo) []byte {
 	var entry []byte
 	switch si.codecID {
 	case avCodecH264:
-		entry = mp4Avc1(si)
+		entry = videoEntry("avc1", si, bx("avcC", si.extradata))
 	case avCodecHEVC:
-		entry = mp4Hvc1(si)
+		entry = videoEntry("hvc1", si, bx("hvcC", si.extradata))
+	case avCodecVP8:
+		entry = videoEntry("vp08", si, bx("vpcC", si.extradata))
+	case avCodecVP9:
+		entry = videoEntry("vp09", si, bx("vpcC", si.extradata))
+	case avCodecAV1:
+		entry = videoEntry("av01", si, bx("av1C", si.extradata))
 	case avCodecAAC:
-		entry = mp4Mp4a(si)
+		entry = audioEntry("mp4a", si, mp4Esds(0x40, si.extradata))
+	case avCodecMP3:
+		entry = audioEntry("mp4a", si, mp4Esds(0x6B, si.extradata))
+	case avCodecOPUS:
+		entry = audioEntry("Opus", si, mp4DOps(si))
 	default:
 		return fbx("stsd", 0, 0, u32(0))
 	}
@@ -941,7 +968,7 @@ func buildMoov(allTracks []trackState) []byte {
 			continue
 		}
 		si := t.info
-		if si.codecID != avCodecH264 && si.codecID != avCodecHEVC && si.codecID != avCodecAAC {
+		if !supportedCodec(si.codecID) {
 			logger.Debug("skipping unsupported codec in mp4 mux", "codec_id", si.codecID, "type", si.codecType)
 			continue
 		}
@@ -1055,7 +1082,7 @@ func newSegRecorder(dir, path string, header *message) (*segRecorder, error) {
 		return nil, err
 	}
 	if !canRecord(streams) {
-		return nil, fmt.Errorf("no supported codecs (need H.264 or AAC, got codec_ids: %v)", codecIDs(streams))
+		return nil, fmt.Errorf("no supported codecs (got codec_ids: %v)", codecIDs(streams))
 	}
 	sr := &segRecorder{dir: dir, path: path, header: header}
 	sr.startNewSegment()
