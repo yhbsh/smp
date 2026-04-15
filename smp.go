@@ -550,6 +550,23 @@ func parseHeader(m *message) ([]streamInfo, error) {
 	return out, nil
 }
 
+func canRecord(streams []streamInfo) bool {
+	for _, si := range streams {
+		if si.codecID == avCodecH264 || si.codecID == avCodecAAC {
+			return true
+		}
+	}
+	return false
+}
+
+func codecIDs(streams []streamInfo) []uint32 {
+	ids := make([]uint32, len(streams))
+	for i, si := range streams {
+		ids[i] = si.codecID
+	}
+	return ids
+}
+
 type packetInfo struct {
 	streamIdx uint8
 	pts       int64
@@ -676,6 +693,9 @@ func newMp4Recorder(filename string, header *message) (*mp4Recorder, error) {
 	streams, err := parseHeader(header)
 	if err != nil {
 		return nil, err
+	}
+	if !canRecord(streams) {
+		return nil, fmt.Errorf("no supported codecs (need H.264 or AAC, got codec_ids: %v)", codecIDs(streams))
 	}
 	f, err := os.Create(filename)
 	if err != nil {
@@ -1013,10 +1033,17 @@ type segRecorder struct {
 	mu       sync.Mutex
 }
 
-func newSegRecorder(dir, path string, header *message) *segRecorder {
+func newSegRecorder(dir, path string, header *message) (*segRecorder, error) {
+	streams, err := parseHeader(header)
+	if err != nil {
+		return nil, err
+	}
+	if !canRecord(streams) {
+		return nil, fmt.Errorf("no supported codecs (need H.264 or AAC, got codec_ids: %v)", codecIDs(streams))
+	}
 	sr := &segRecorder{dir: dir, path: path, header: header}
 	sr.startNewSegment()
-	return sr
+	return sr, nil
 }
 
 func (sr *segRecorder) write(m *message) {
@@ -1386,11 +1413,15 @@ func (srv *server) servePush(conn net.Conn, s *stream, peer string, seamless boo
 			}
 			first = false
 
-			sr = newSegRecorder(srv.dir, s.path, m)
-			srv.tm.mu.Lock()
-			srv.tm.autoRecs[s.path] = sr
-			srv.tm.mu.Unlock()
-			logger.Info("auto-record started", "peer", peer, "path", s.path)
+			if r, err := newSegRecorder(srv.dir, s.path, m); err != nil {
+				logger.Warn("auto-record skipped", "path", s.path, "err", err)
+			} else {
+				sr = r
+				srv.tm.mu.Lock()
+				srv.tm.autoRecs[s.path] = sr
+				srv.tm.mu.Unlock()
+				logger.Info("auto-record started", "peer", peer, "path", s.path)
+			}
 			continue
 		}
 
