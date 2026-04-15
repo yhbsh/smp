@@ -1369,7 +1369,7 @@ type recordTask struct {
 	State     taskState `json:"state"`
 	StartedAt time.Time `json:"started_at"`
 	Filename  string    `json:"filename,omitempty"`
-	S3URL     string    `json:"s3_url,omitempty"`
+	S3Path    string    `json:"s3_path,omitempty"`
 	Error     string    `json:"error,omitempty"`
 
 	rec    recorder
@@ -1548,7 +1548,7 @@ func (tm *taskManager) handleClip(w http.ResponseWriter, r *http.Request) {
 
 	logger.Info("clip created", "path", req.Path, "seconds", req.Seconds, "url", s3URL)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"s3_url": s3URL})
+	json.NewEncoder(w).Encode(map[string]string{"s3_path": s3URL})
 }
 
 func (tm *taskManager) recordLoop(task *recordTask, maxDur time.Duration) {
@@ -1589,7 +1589,7 @@ stop:
 		logger.Error("s3 upload failed", "task", task.ID, "err", err)
 	} else {
 		task.State = stateDone
-		task.S3URL = s3URL
+		task.S3Path = s3URL
 		os.Remove(task.Filename)
 		logger.Info("recording uploaded", "task", task.ID, "url", s3URL)
 	}
@@ -1670,7 +1670,7 @@ func uploadToS3(filePath, s3Key string) (string, error) {
 		return "", fmt.Errorf("s3: %d %s", resp.StatusCode, string(body))
 	}
 
-	return endpoint, nil
+	return s3Key, nil
 }
 
 func hmacSHA256(key, data []byte) []byte {
