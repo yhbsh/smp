@@ -559,35 +559,66 @@ func (r *mp4Recorder) write(m *message) {
 }
 
 func (r *mp4Recorder) stop() {
-	// Read mdat data from file (everything after ftyp + mdat header).
-	mdatDataLen := r.pos - (r.mdatPos + 8)
-	r.f.Seek(r.mdatPos+8, io.SeekStart)
-	mdatData := make([]byte, mdatDataLen)
-	io.ReadFull(r.f, mdatData)
+	writeFaststart(r.f, r.tracks, r.mdatPos, r.pos)
+}
 
-	// Build moov to learn its size, then shift all sample offsets so
-	// co64 entries account for moov being inserted before mdat (faststart).
-	moov := r.moov()
+func (r *mp4Recorder) stopRaw() {
+	mdatSize := r.pos - r.mdatPos
+	r.f.Seek(r.mdatPos, io.SeekStart)
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], uint32(mdatSize))
+	r.f.Write(b[:])
+	r.f.Seek(r.pos, io.SeekStart)
+	r.f.Write(buildMoov(r.tracks))
+	r.f.Close()
+}
+
+func writeFaststart(f *os.File, tracks []trackState, mdatPos, pos int64) {
+	mdatDataLen := pos - (mdatPos + 8)
+	f.Seek(mdatPos+8, io.SeekStart)
+	mdatData := make([]byte, mdatDataLen)
+	io.ReadFull(f, mdatData)
+
+	moov := buildMoov(tracks)
 	moovSize := int64(len(moov))
-	for i := range r.tracks {
-		for j := range r.tracks[i].samples {
-			r.tracks[i].samples[j].offset += moovSize
+	for i := range tracks {
+		for j := range tracks[i].samples {
+			tracks[i].samples[j].offset += moovSize
 		}
 	}
-	moov = r.moov()
+	moov = buildMoov(tracks)
 
-	// Rewrite file: ftyp | moov | mdat — playable over HTTP without range seeks.
 	ftypLen := int64(len(mp4Ftyp()))
-	mdatTotal := r.pos - r.mdatPos
-	r.f.Seek(ftypLen, io.SeekStart)
-	r.f.Write(moov)
+	mdatTotal := pos - mdatPos
+	f.Seek(ftypLen, io.SeekStart)
+	f.Write(moov)
 	var mdatHdr [8]byte
 	binary.BigEndian.PutUint32(mdatHdr[:4], uint32(mdatTotal))
 	copy(mdatHdr[4:], "mdat")
-	r.f.Write(mdatHdr[:])
-	r.f.Write(mdatData)
-	r.f.Truncate(ftypLen + moovSize + mdatTotal)
-	r.f.Close()
+	f.Write(mdatHdr[:])
+	f.Write(mdatData)
+	f.Truncate(ftypLen + moovSize + mdatTotal)
+	f.Close()
+}
+
+func newMp4Recorder(filename string, header *message) (*mp4Recorder, error) {
+	streams, err := parseHeader(header)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.Create(filename)
+	if err != nil {
+		return nil, err
+	}
+	ftyp := mp4Ftyp()
+	f.Write(ftyp)
+	mdatPos := int64(len(ftyp))
+	f.Write([]byte{0, 0, 0, 0, 'm', 'd', 'a', 't'})
+	tracks := make([]trackState, len(streams))
+	for i, si := range streams {
+		tracks[i].info = si
+	}
+	return &mp4Recorder{f: f, tracks: tracks, mdatPos: mdatPos, pos: mdatPos + 8}, nil
 }
 
 // mp4 box helpers
@@ -794,11 +825,11 @@ func mp4Stss(samples []sampleMeta) []byte {
 	return fbx("stss", 0, 0, b)
 }
 
-func (r *mp4Recorder) moov() []byte {
+func buildMoov(allTracks []trackState) []byte {
 	var movieDur uint32
 	var traks [][]byte
-	for i := range r.tracks {
-		t := &r.tracks[i]
+	for i := range allTracks {
+		t := &allTracks[i]
 		if len(t.samples) == 0 {
 			continue
 		}
@@ -835,7 +866,7 @@ func (r *mp4Recorder) moov() []byte {
 			),
 		))
 	}
-	parts := [][]byte{mp4Mvhd(movieDur, uint32(len(r.tracks)+1))}
+	parts := [][]byte{mp4Mvhd(movieDur, uint32(len(allTracks)+1))}
 	parts = append(parts, traks...)
 	return bx("moov", parts...)
 }
@@ -874,27 +905,249 @@ func newRecorder(method, dir, streamPath string, header *message) (recorder, str
 
 	case "mp4":
 		fn := base + ".mp4"
-		streams, err := parseHeader(header)
+		rec, err := newMp4Recorder(fn, header)
 		if err != nil {
 			return nil, "", err
 		}
-		f, err := os.Create(fn)
-		if err != nil {
-			return nil, "", err
-		}
-		ftyp := mp4Ftyp()
-		f.Write(ftyp)
-		mdatPos := int64(len(ftyp))
-		f.Write([]byte{0, 0, 0, 0, 'm', 'd', 'a', 't'})
-		tracks := make([]trackState, len(streams))
-		for i, si := range streams {
-			tracks[i].info = si
-		}
-		return &mp4Recorder{f: f, tracks: tracks, mdatPos: mdatPos, pos: mdatPos + 8}, fn, nil
+		return rec, fn, nil
 
 	default:
 		return nil, "", fmt.Errorf("unknown record method %q (use mp4, ffmpeg, or smp)", method)
 	}
+}
+
+// --- segmented recorder ---
+
+const segDuration = 10 * time.Second
+
+type segmentInfo struct {
+	filename string
+	created  time.Time
+	tracks   []trackState
+}
+
+type segRecorder struct {
+	dir      string
+	path     string
+	header   *message
+	segments []segmentInfo
+	current  *mp4Recorder
+	curStart time.Time
+	segCount int
+	mu       sync.Mutex
+}
+
+func newSegRecorder(dir, path string, header *message) *segRecorder {
+	sr := &segRecorder{dir: dir, path: path, header: header}
+	sr.startNewSegment()
+	return sr
+}
+
+func (sr *segRecorder) write(m *message) {
+	if m.mtype == msgHeader {
+		return
+	}
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	if sr.current == nil {
+		return
+	}
+	if m.mtype == msgKey && time.Since(sr.curStart) >= segDuration {
+		sr.cutSegment()
+	}
+	sr.current.write(m)
+}
+
+func (sr *segRecorder) cutSegment() {
+	if sr.current == nil {
+		return
+	}
+	hasSamples := false
+	for _, t := range sr.current.tracks {
+		if len(t.samples) > 0 {
+			hasSamples = true
+			break
+		}
+	}
+	if !hasSamples {
+		sr.current.f.Close()
+		os.Remove(sr.current.f.Name())
+		sr.startNewSegment()
+		return
+	}
+	tracks := make([]trackState, len(sr.current.tracks))
+	for i, t := range sr.current.tracks {
+		tracks[i].info = t.info
+		tracks[i].samples = make([]sampleMeta, len(t.samples))
+		copy(tracks[i].samples, t.samples)
+	}
+	sr.segments = append(sr.segments, segmentInfo{
+		filename: sr.current.f.Name(),
+		created:  sr.curStart,
+		tracks:   tracks,
+	})
+	sr.current.stopRaw()
+	sr.startNewSegment()
+}
+
+func (sr *segRecorder) startNewSegment() {
+	name := fmt.Sprintf("seg_%s_%03d",
+		strings.ReplaceAll(strings.TrimPrefix(sr.path, "/"), "/", "_"),
+		sr.segCount)
+	sr.segCount++
+	fn := filepath.Join(sr.dir, name+".mp4")
+	rec, err := newMp4Recorder(fn, sr.header)
+	if err != nil {
+		logger.Warn("failed to start segment", "path", sr.path, "err", err)
+		sr.current = nil
+		return
+	}
+	sr.current = rec
+	sr.curStart = time.Now()
+}
+
+func (sr *segRecorder) finalize() (string, error) {
+	sr.mu.Lock()
+	sr.cutSegment()
+	segs := sr.segments
+	sr.segments = nil
+	sr.mu.Unlock()
+
+	if len(segs) == 0 {
+		return "", errors.New("no segments")
+	}
+
+	ts := time.Now().Format("20060102_150405")
+	name := strings.ReplaceAll(strings.TrimPrefix(sr.path, "/"), "/", "_")
+	out := filepath.Join(sr.dir, "recording_"+name+"_"+ts+".mp4")
+
+	if err := mergeSegments(segs, out); err != nil {
+		return "", err
+	}
+	for _, seg := range segs {
+		os.Remove(seg.filename)
+	}
+	return out, nil
+}
+
+func (sr *segRecorder) clip(seconds float64) (string, error) {
+	sr.mu.Lock()
+	sr.cutSegment()
+	cutoff := time.Now().Add(-time.Duration(seconds * float64(time.Second)))
+	var clipSegs []segmentInfo
+	for _, seg := range sr.segments {
+		if seg.created.After(cutoff) {
+			clipSegs = append(clipSegs, seg)
+		}
+	}
+	sr.mu.Unlock()
+
+	if len(clipSegs) == 0 {
+		return "", errors.New("no data in requested time range")
+	}
+
+	ts := time.Now().Format("20060102_150405")
+	name := strings.ReplaceAll(strings.TrimPrefix(sr.path, "/"), "/", "_")
+	out := filepath.Join(sr.dir, "clip_"+name+"_"+ts+".mp4")
+
+	if err := mergeSegments(clipSegs, out); err != nil {
+		return "", err
+	}
+	return out, nil
+}
+
+// mergeSegments combines multiple segment files into one faststart MP4.
+// Segment files have layout: ftyp(32) | mdat(8+data) | moov.
+// Sample offsets in trackState point into the segment file (data starts at 40).
+func mergeSegments(segs []segmentInfo, outPath string) error {
+	if len(segs) == 0 {
+		return errors.New("no segments")
+	}
+
+	// Compute data length per segment and build merged tracks.
+	merged := make([]trackState, len(segs[0].tracks))
+	for i := range merged {
+		merged[i].info = segs[0].tracks[i].info
+	}
+
+	type segRange struct{ start, length int64 }
+	ranges := make([]segRange, len(segs))
+
+	var totalData int64
+	for si, seg := range segs {
+		var maxEnd int64
+		for _, t := range seg.tracks {
+			for _, s := range t.samples {
+				if end := s.offset + int64(s.size); end > maxEnd {
+					maxEnd = end
+				}
+			}
+		}
+		dataLen := maxEnd - 40
+		if dataLen < 0 {
+			dataLen = 0
+		}
+		ranges[si] = segRange{start: totalData, length: dataLen}
+
+		for ti, t := range seg.tracks {
+			for _, s := range t.samples {
+				merged[ti].samples = append(merged[ti].samples, sampleMeta{
+					offset: totalData + (s.offset - 40), // relative to merged mdat start
+					size:   s.size,
+					dts:    s.dts,
+					pts:    s.pts,
+					dur:    s.dur,
+					key:    s.key,
+				})
+			}
+		}
+		totalData += dataLen
+	}
+
+	// Fix durations at segment boundaries using absolute DTS.
+	for ti := range merged {
+		samples := merged[ti].samples
+		for i := 0; i < len(samples)-1; i++ {
+			samples[i].dur = samples[i+1].dts - samples[i].dts
+		}
+	}
+
+	// Build moov to learn its size, then shift offsets for faststart.
+	moov := buildMoov(merged)
+	moovSize := int64(len(moov))
+	base := int64(len(mp4Ftyp())) + moovSize + 8 // ftyp + moov + mdat header
+	for ti := range merged {
+		for j := range merged[ti].samples {
+			merged[ti].samples[j].offset += base
+		}
+	}
+	moov = buildMoov(merged)
+
+	// Write output file: ftyp | moov | mdat header | data from each segment.
+	out, err := os.Create(outPath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	out.Write(mp4Ftyp())
+	out.Write(moov)
+
+	var mdatHdr [8]byte
+	binary.BigEndian.PutUint32(mdatHdr[:4], uint32(8+totalData))
+	copy(mdatHdr[4:], "mdat")
+	out.Write(mdatHdr[:])
+
+	for si, seg := range segs {
+		f, err := os.Open(seg.filename)
+		if err != nil {
+			return err
+		}
+		f.Seek(40, io.SeekStart)
+		io.CopyN(out, f, ranges[si].length)
+		f.Close()
+	}
+	return nil
 }
 
 // --- server ---
@@ -902,6 +1155,7 @@ func newRecorder(method, dir, streamPath string, header *message) (recorder, str
 type server struct {
 	hub *hub
 	dir string
+	tm  *taskManager
 }
 
 func (srv *server) handle(conn net.Conn) {
@@ -959,20 +1213,27 @@ func (srv *server) servePush(conn net.Conn, s *stream, peer string, seamless boo
 	var packets uint64
 	var keyframes uint64
 	var bytes uint64
-	var rec recorder
-	var recFile string
+	var sr *segRecorder
 
 	defer func() {
-		if rec != nil {
-			rec.stop()
-			logger.Info("auto-record stopped", "peer", peer, "path", s.path, "file", recFile)
+		if sr != nil {
+			srv.tm.mu.Lock()
+			delete(srv.tm.autoRecs, s.path)
+			srv.tm.mu.Unlock()
+
 			go func() {
-				s3Key := "recordings/" + filepath.Base(recFile)
-				s3URL, err := uploadToS3(recFile, s3Key)
+				merged, err := sr.finalize()
 				if err != nil {
-					logger.Error("auto-record upload failed", "file", recFile, "err", err)
+					logger.Error("auto-record finalize failed", "path", s.path, "err", err)
+					return
+				}
+				logger.Info("auto-record finalized", "path", s.path, "file", merged)
+				s3Key := "recordings/" + filepath.Base(merged)
+				s3URL, err := uploadToS3(merged, s3Key)
+				if err != nil {
+					logger.Error("auto-record upload failed", "file", merged, "err", err)
 				} else {
-					os.Remove(recFile)
+					os.Remove(merged)
 					logger.Info("auto-record uploaded", "url", s3URL)
 				}
 			}()
@@ -1005,15 +1266,11 @@ func (srv *server) servePush(conn net.Conn, s *stream, peer string, seamless boo
 			}
 			first = false
 
-			r, fn, err := newRecorder("mp4", srv.dir, s.path, m)
-			if err != nil {
-				logger.Warn("auto-record failed to start", "path", s.path, "err", err)
-			} else {
-				rec = r
-				recFile = fn
-				rec.write(m)
-				logger.Info("auto-record started", "peer", peer, "path", s.path, "file", recFile)
-			}
+			sr = newSegRecorder(srv.dir, s.path, m)
+			srv.tm.mu.Lock()
+			srv.tm.autoRecs[s.path] = sr
+			srv.tm.mu.Unlock()
+			logger.Info("auto-record started", "peer", peer, "path", s.path)
 			continue
 		}
 
@@ -1035,8 +1292,8 @@ func (srv *server) servePush(conn net.Conn, s *stream, peer string, seamless boo
 				"peer", peer, "path", s.path, "type", fmt.Sprintf("0x%02x", m.mtype))
 		}
 
-		if rec != nil {
-			rec.write(m)
+		if sr != nil {
+			sr.write(m)
 		}
 	}
 }
@@ -1122,10 +1379,11 @@ type recordTask struct {
 }
 
 type taskManager struct {
-	mu    sync.Mutex
-	tasks map[string]*recordTask
-	hub   *hub
-	dir   string
+	mu       sync.Mutex
+	tasks    map[string]*recordTask
+	autoRecs map[string]*segRecorder
+	hub      *hub
+	dir      string
 }
 
 func randomID() string {
@@ -1248,6 +1506,51 @@ func (tm *taskManager) handleTasks(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(out)
 }
 
+func (tm *taskManager) handleClip(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	var req struct {
+		Path    string  `json:"path"`
+		Seconds float64 `json:"seconds"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	if req.Path == "" || req.Seconds <= 0 {
+		http.Error(w, `{"error":"path and seconds required"}`, 400)
+		return
+	}
+
+	tm.mu.Lock()
+	sr, ok := tm.autoRecs[req.Path]
+	tm.mu.Unlock()
+	if !ok {
+		http.Error(w, `{"error":"no active publisher on path"}`, 404)
+		return
+	}
+
+	clipPath, err := sr.clip(req.Seconds)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), 500)
+		return
+	}
+
+	s3Key := "clips/" + filepath.Base(clipPath)
+	s3URL, err := uploadToS3(clipPath, s3Key)
+	os.Remove(clipPath)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), 500)
+		return
+	}
+
+	logger.Info("clip created", "path", req.Path, "seconds", req.Seconds, "url", s3URL)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"s3_url": s3URL})
+}
+
 func (tm *taskManager) recordLoop(task *recordTask, maxDur time.Duration) {
 	timer := time.NewTimer(maxDur)
 	defer timer.Stop()
@@ -1298,6 +1601,7 @@ func (tm *taskManager) serve(addr string) {
 	mux.HandleFunc("/record/start", tm.handleStart)
 	mux.HandleFunc("/record/stop", tm.handleStop)
 	mux.HandleFunc("/record/tasks", tm.handleTasks)
+	mux.HandleFunc("/record/clip", tm.handleClip)
 	logger.Info("api listening", "addr", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		logger.Fatal("api listen failed", "err", err)
@@ -1399,10 +1703,10 @@ func main() {
 
 	dir := "recordings"
 	os.MkdirAll(dir, 0755)
-	tm := &taskManager{tasks: make(map[string]*recordTask), hub: h, dir: dir}
+	tm := &taskManager{tasks: make(map[string]*recordTask), autoRecs: make(map[string]*segRecorder), hub: h, dir: dir}
 	go tm.serve(*apiAddr)
 
-	srv := &server{hub: h, dir: dir}
+	srv := &server{hub: h, dir: dir, tm: tm}
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
