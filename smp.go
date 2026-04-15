@@ -904,14 +904,18 @@ func buildMoov(allTracks []trackState) []byte {
 		if len(t.samples) == 0 {
 			continue
 		}
-		ts := t.info.tbDen
+		si := t.info
+		if si.codecID != avCodecH264 && si.codecID != avCodecAAC {
+			logger.Debug("skipping unsupported codec in mp4 mux", "codec_id", si.codecID, "type", si.codecType)
+			continue
+		}
+		ts := si.tbDen
 		first, last := t.samples[0], t.samples[len(t.samples)-1]
 		durTS := uint32(last.dts + last.dur - first.dts)
 		durMovie := uint32(float64(durTS) * 1000 / float64(ts))
 		if durMovie > movieDur {
 			movieDur = durMovie
 		}
-		si := t.info
 		hdlrType, hdlrName := "vide", "VideoHandler"
 		var mhd []byte
 		if si.codecType == avMediaAudio {
