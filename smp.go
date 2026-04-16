@@ -355,6 +355,10 @@ func (s *stream) publish(m *message) {
 		s.gop = []*message{m}
 		s.gopBytes = m.size
 		s.gopWarned = false
+		// Wake subscribers blocked in subscribe() waiting for the first
+		// keyframe. Without this they only re-check on header change or
+		// headerWaitTime expiry.
+		s.cond.Broadcast()
 	case len(s.gop) > 0:
 		s.gop = append(s.gop, m)
 		s.gopBytes += m.size
@@ -363,10 +367,13 @@ func (s *stream) publish(m *message) {
 				"path", s.path, "bytes", s.gopBytes, "msgs", len(s.gop))
 			s.gopWarned = true
 		}
+	default:
+		// Packet arrived without a preceding KEY (stream startup before
+		// the first keyframe, or just after a header replacement reset
+		// the GOP). Drop it: any subscriber that consumed it would have
+		// no reference frame and decode garbage.
+		return
 	}
-	// PACKETs that arrive before the first KEY are forwarded live but not
-	// kept in the GOP — a late subscriber starting from them would have no
-	// reference frames.
 
 	for ch := range s.subs {
 		select {
@@ -382,8 +389,11 @@ func (s *stream) subscribe() (chan *message, *message, []*message, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Wait for header AND first keyframe. Without the keyframe, the live
+	// channel could deliver P-frames first, leaving the decoder with no
+	// reference and producing garbage until the next IDR.
 	deadline := time.Now().Add(headerWaitTime)
-	for s.header == nil {
+	for s.header == nil || len(s.gop) == 0 {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			return nil, nil, nil, false
@@ -1316,6 +1326,7 @@ type segRecorder struct {
 	current  *mp4Recorder
 	curStart time.Time
 	segCount int
+	seenKey  bool // gate first segment: drop packets until publisher sends a KEY
 	mu       sync.Mutex
 }
 
@@ -1341,8 +1352,16 @@ func (sr *segRecorder) write(m *message) {
 	if sr.current == nil {
 		return
 	}
-	if m.mtype == msgKey && time.Since(sr.curStart) >= segDuration {
+	if !sr.seenKey {
+		if m.mtype != msgKey {
+			return
+		}
+		sr.seenKey = true
+		sr.curStart = time.Now() // segment clock starts at the first real sample
+	} else if m.mtype == msgKey && time.Since(sr.curStart) >= segDuration {
 		sr.cutSegment()
+		// cutSegment starts a fresh segment; the upcoming KEY becomes its
+		// first sample, so seenKey stays true.
 	}
 	sr.current.write(m)
 }
