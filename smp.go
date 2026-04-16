@@ -85,6 +85,11 @@ type Config struct {
 	RecordDir string   // segment/clip directory, default "recordings"
 	LogLevel  LogLevel // default InfoLevel
 	AWS       AWSConfig
+
+	// ShouldRecord decides whether to auto-record (and enable clipping) for a
+	// given stream path when a publisher connects. Nil or returning false
+	// disables recording for that path; the /clip endpoint will return 404.
+	ShouldRecord func(path string) bool
 }
 
 type Server struct {
@@ -116,7 +121,7 @@ func New(cfg Config) *Server {
 		cfg: cfg,
 		hub: h,
 		tm:  tm,
-		rel: &server{hub: h, dir: cfg.RecordDir, tm: tm},
+		rel: &server{hub: h, dir: cfg.RecordDir, tm: tm, shouldRecord: cfg.ShouldRecord},
 	}
 }
 
@@ -1561,9 +1566,10 @@ func sampleWallTime(segCreated time.Time, firstDTS, sampleDTS int64, info stream
 // --- server ---
 
 type server struct {
-	hub *hub
-	dir string
-	tm  *taskManager
+	hub          *hub
+	dir          string
+	tm           *taskManager
+	shouldRecord func(path string) bool
 }
 
 func (srv *server) handle(conn net.Conn) {
@@ -1675,14 +1681,16 @@ func (srv *server) servePush(conn net.Conn, s *stream, peer string, seamless boo
 			}
 			first = false
 
-			if r, err := newSegRecorder(srv.dir, s.path, m); err != nil {
-				logger.Warn("auto-record skipped", "path", s.path, "err", err)
-			} else {
-				sr = r
-				srv.tm.mu.Lock()
-				srv.tm.autoRecs[s.path] = sr
-				srv.tm.mu.Unlock()
-				logger.Info("auto-record started", "peer", peer, "path", s.path)
+			if srv.shouldRecord != nil && srv.shouldRecord(s.path) {
+				if r, err := newSegRecorder(srv.dir, s.path, m); err != nil {
+					logger.Warn("auto-record skipped", "path", s.path, "err", err)
+				} else {
+					sr = r
+					srv.tm.mu.Lock()
+					srv.tm.autoRecs[s.path] = sr
+					srv.tm.mu.Unlock()
+					logger.Info("auto-record started", "peer", peer, "path", s.path)
+				}
 			}
 			continue
 		}

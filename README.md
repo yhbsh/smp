@@ -33,6 +33,12 @@ import "github.com/yhbsh/smp"
 s := smp.New(smp.Config{
     Addr:      ":7777",
     RecordDir: "recordings",
+
+    // Opt in to auto-recording per stream path. Nil (default) disables
+    // recording entirely; the /clip endpoint then returns 404.
+    ShouldRecord: func(path string) bool {
+        return strings.HasPrefix(path, "/live/")
+    },
 })
 
 mux := http.NewServeMux()

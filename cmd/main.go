@@ -17,6 +17,7 @@ func main() {
 			AccessKey: awsAccessKeyID,
 			SecretKey: awsSecretKey,
 		},
+		ShouldRecord: func(path string) bool { return true },
 	})
 
 	mux := http.NewServeMux()
