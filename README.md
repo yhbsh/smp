@@ -31,13 +31,15 @@ Supported codecs: H.264, HEVC/H.265, VP8, VP9, AV1, AAC, MP3, Opus.
 import "github.com/yhbsh/smp"
 
 s := smp.New(smp.Config{
-    Addr:      ":7777",
-    RecordDir: "recordings",
+    Addr: ":7777",
 
-    // Opt in to auto-recording per stream path. Nil (default) disables
-    // recording entirely; the /clip endpoint then returns 404.
-    ShouldRecord: func(path string) bool {
-        return strings.HasPrefix(path, "/live/")
+    // Recording is opt-in: omit Record to disable entirely.
+    // Set ShouldRecord to gate auto-record per path; nil records all.
+    Record: &smp.RecordConfig{
+        Dir: "recordings",
+        ShouldRecord: func(path string) bool {
+            return strings.HasPrefix(path, "/live/")
+        },
     },
 })
 

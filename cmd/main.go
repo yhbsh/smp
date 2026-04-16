@@ -8,16 +8,15 @@ import (
 
 func main() {
 	s := smp.New(smp.Config{
-		Addr:      ":7777",
-		RecordDir: "recordings",
-		LogLevel:  smp.InfoLevel,
+		Addr:     ":7777",
+		LogLevel: smp.InfoLevel,
 		AWS: smp.AWSConfig{
 			Bucket:    awsBucket,
 			Region:    awsRegion,
 			AccessKey: awsAccessKeyID,
 			SecretKey: awsSecretKey,
 		},
-		ShouldRecord: func(path string) bool { return true },
+		Record: &smp.RecordConfig{Dir: "recordings"},
 	})
 
 	mux := http.NewServeMux()

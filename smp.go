@@ -81,14 +81,22 @@ type AWSConfig struct {
 }
 
 type Config struct {
-	Addr      string   // TCP relay address, default ":7777"
-	RecordDir string   // segment/clip directory, default "recordings"
-	LogLevel  LogLevel // default InfoLevel
-	AWS       AWSConfig
+	Addr     string   // TCP relay address, default ":7777"
+	LogLevel LogLevel // default InfoLevel
+	AWS      AWSConfig
 
-	// ShouldRecord decides whether to auto-record (and enable clipping) for a
-	// given stream path when a publisher connects. Nil or returning false
-	// disables recording for that path; the /clip endpoint will return 404.
+	// Record enables the recording subsystem (auto-record + /start + /clip).
+	// Nil disables it entirely: no files are written, /start returns 503,
+	// /clip returns 404.
+	Record *RecordConfig
+}
+
+type RecordConfig struct {
+	// Dir is the directory for segments, recordings, and clips. Default ".".
+	Dir string
+	// ShouldRecord decides whether to auto-record a given stream path when a
+	// publisher connects. Nil means record every path. Return false to skip
+	// auto-record for a path (manual /start is still available for it).
 	ShouldRecord func(path string) bool
 }
 
@@ -103,25 +111,36 @@ func New(cfg Config) *Server {
 	if cfg.Addr == "" {
 		cfg.Addr = ":7777"
 	}
-	if cfg.RecordDir == "" {
-		cfg.RecordDir = "."
-	}
 	logger.SetLevel(cfg.LogLevel)
-	os.MkdirAll(cfg.RecordDir, 0755)
+
+	dir := ""
+	var shouldRecord func(string) bool
+	if cfg.Record != nil {
+		dir = cfg.Record.Dir
+		if dir == "" {
+			dir = "."
+		}
+		os.MkdirAll(dir, 0755)
+		shouldRecord = cfg.Record.ShouldRecord
+		if shouldRecord == nil {
+			shouldRecord = func(string) bool { return true }
+		}
+	}
 
 	h := newHub()
 	tm := &taskManager{
 		tasks:    make(map[string]*recordTask),
 		autoRecs: make(map[string]*segRecorder),
 		hub:      h,
-		dir:      cfg.RecordDir,
+		dir:      dir,
 		aws:      cfg.AWS,
+		enabled:  cfg.Record != nil,
 	}
 	return &Server{
 		cfg: cfg,
 		hub: h,
 		tm:  tm,
-		rel: &server{hub: h, dir: cfg.RecordDir, tm: tm, shouldRecord: cfg.ShouldRecord},
+		rel: &server{hub: h, dir: dir, tm: tm, shouldRecord: shouldRecord},
 	}
 }
 
@@ -1806,6 +1825,7 @@ type taskManager struct {
 	hub      *hub
 	dir      string
 	aws      AWSConfig
+	enabled  bool
 }
 
 func randomID() string {
@@ -1815,6 +1835,10 @@ func randomID() string {
 }
 
 func (tm *taskManager) handleStart(w http.ResponseWriter, r *http.Request) {
+	if !tm.enabled {
+		http.Error(w, `{"error":"recording disabled"}`, 503)
+		return
+	}
 	if r.Method != "POST" {
 		http.Error(w, "method not allowed", 405)
 		return
@@ -1929,6 +1953,10 @@ func (tm *taskManager) handleTasks(w http.ResponseWriter, r *http.Request) {
 }
 
 func (tm *taskManager) handleClip(w http.ResponseWriter, r *http.Request) {
+	if !tm.enabled {
+		http.Error(w, `{"error":"recording disabled"}`, 503)
+		return
+	}
 	if r.Method != "POST" {
 		http.Error(w, "method not allowed", 405)
 		return
