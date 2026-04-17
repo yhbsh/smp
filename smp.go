@@ -23,25 +23,22 @@
 //   Types:
 //     0x01 HEADER  (stream descriptions, sent once per session)
 //     0x02 PACKET  (regular packet)
-//     0x03 KEY     (primary stream keyframe — GOP boundary)
+//     0x03 KEY     (primary stream keyframe)
 //
 // Server semantics:
 //
-//   - Per stream path it keeps the most recent HEADER and the current GOP
-//     (every PACKET/KEY since the last KEY, KEY at index 0).
-//   - On a new KEY the GOP is reset, so a fresh subscriber catches up with
-//     HEADER + current GOP + live packets — join latency = one keyframe
-//     interval (and zero for primary=audio streams since AAC frames are
-//     all keys).
+//   - Per stream path it keeps the most recent HEADER.
+//   - A new subscriber receives the HEADER immediately, then waits silently
+//     until the next KEY message from the publisher; from that KEY onward
+//     the live stream is forwarded. This guarantees the decoder starts on
+//     a reference frame without maintaining a GOP cache.
 //   - When a publisher disconnects the stream is kept alive: subscribers
-//     remain attached and the cached header/GOP are preserved.
+//     remain attached and the cached header is preserved.
 //   - A new publisher connecting to the same path takes over only if the
 //     previous publisher is gone. If the new session id is non-zero and
-//     matches the previous session id the existing GOP is kept (true
-//     seamless reconnect); otherwise the GOP is dropped because the codec
-//     parameters may have changed.
-//   - GOP byte size is tracked and a warning is emitted if it grows past
-//     gopWarnBytes (long IDR interval / runaway).
+//     matches the previous session id the existing header is kept (true
+//     seamless reconnect); otherwise the header is dropped because the
+//     codec parameters may have changed.
 //
 // Usage:
 //   smp -addr :7777 [-log debug|info|warn|error]
@@ -126,7 +123,6 @@ const (
 	sessionIDLen   = 16
 	subBuffer      = 1024
 	maxMessageLen  = 64 * 1024 * 1024
-	gopWarnBytes   = 32 * 1024 * 1024
 	headerWaitTime = 10 * time.Second
 )
 
@@ -223,16 +219,21 @@ func newMessage(payload []byte) *message {
 
 // --- streams + hub ---
 
+// subscriber tracks one pull client. started flips to true when the first
+// KEY message after subscription arrives; packets before that are dropped
+// so the decoder always begins on a reference frame.
+type subscriber struct {
+	ch      chan *message
+	started bool
+}
+
 type stream struct {
 	path string
 
 	mu              sync.Mutex
 	cond            *sync.Cond
-	subs            map[chan *message]struct{}
+	subs            map[*subscriber]struct{}
 	header          *message
-	gop             []*message
-	gopBytes        int
-	gopWarned       bool
 	publisherActive bool
 	sessionID       [sessionIDLen]byte
 	hasSession      bool
@@ -241,14 +242,14 @@ type stream struct {
 }
 
 func newStream(path string) *stream {
-	s := &stream{path: path, subs: make(map[chan *message]struct{})}
+	s := &stream{path: path, subs: make(map[*subscriber]struct{})}
 	s.cond = sync.NewCond(&s.mu)
 	return s
 }
 
 // claim attempts to make the caller the active publisher. Returns ok=false if
 // another publisher is currently active. seamless==true means the existing
-// header + GOP were preserved (true reconnect).
+// header was preserved (true reconnect).
 func (s *stream) claim(sid [sessionIDLen]byte, hasSession bool) (ok, seamless bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -260,9 +261,6 @@ func (s *stream) claim(sid [sessionIDLen]byte, hasSession bool) (ok, seamless bo
 	seamless = hasSession && s.hasSession && s.sessionID == sid && s.header != nil
 	if !seamless {
 		s.header = nil
-		s.gop = nil
-		s.gopBytes = 0
-		s.gopWarned = false
 	}
 	s.sessionID = sid
 	s.hasSession = hasSession
@@ -279,9 +277,11 @@ func (s *stream) release() {
 func (s *stream) setHeader(m *message) {
 	s.mu.Lock()
 	s.header = m
-	s.gop = nil
-	s.gopBytes = 0
-	s.gopWarned = false
+	// Existing subscribers must re-sync to the next keyframe since codec
+	// parameters may have changed.
+	for sub := range s.subs {
+		sub.started = false
+	}
 	s.cond.Broadcast()
 	s.mu.Unlock()
 }
@@ -290,53 +290,31 @@ func (s *stream) publish(m *message) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	switch {
-	case m.mtype == msgKey:
-		s.gop = []*message{m}
-		s.gopBytes = m.size
-		s.gopWarned = false
-		// Wake subscribers blocked in subscribe() waiting for the first
-		// keyframe. Without this they only re-check on header change or
-		// headerWaitTime expiry.
-		s.cond.Broadcast()
-	case len(s.gop) > 0:
-		s.gop = append(s.gop, m)
-		s.gopBytes += m.size
-		if !s.gopWarned && s.gopBytes > gopWarnBytes {
-			logger.Warn("gop exceeded byte threshold without keyframe",
-				"path", s.path, "bytes", s.gopBytes, "msgs", len(s.gop))
-			s.gopWarned = true
+	for sub := range s.subs {
+		if m.mtype == msgKey {
+			sub.started = true
 		}
-	default:
-		// Packet arrived without a preceding KEY (stream startup before
-		// the first keyframe, or just after a header replacement reset
-		// the GOP). Drop it: any subscriber that consumed it would have
-		// no reference frame and decode garbage.
-		return
-	}
-
-	for ch := range s.subs {
+		if !sub.started {
+			continue
+		}
 		select {
-		case ch <- m:
+		case sub.ch <- m:
 		default:
 			s.droppedFrames++
 		}
 	}
 }
 
-func (s *stream) subscribe() (chan *message, *message, []*message, bool) {
-	ch := make(chan *message, subBuffer)
+func (s *stream) subscribe() (*subscriber, *message, bool) {
+	sub := &subscriber{ch: make(chan *message, subBuffer)}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Wait for header AND first keyframe. Without the keyframe, the live
-	// channel could deliver P-frames first, leaving the decoder with no
-	// reference and producing garbage until the next IDR.
 	deadline := time.Now().Add(headerWaitTime)
-	for s.header == nil || len(s.gop) == 0 {
+	for s.header == nil {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return nil, nil, nil, false
+			return nil, nil, false
 		}
 		timer := time.AfterFunc(remaining, func() {
 			s.mu.Lock()
@@ -347,25 +325,17 @@ func (s *stream) subscribe() (chan *message, *message, []*message, bool) {
 		timer.Stop()
 	}
 
-	s.subs[ch] = struct{}{}
-	gop := make([]*message, len(s.gop))
-	copy(gop, s.gop)
-	return ch, s.header, gop, true
+	s.subs[sub] = struct{}{}
+	return sub, s.header, true
 }
 
-func (s *stream) unsubscribe(ch chan *message) {
+func (s *stream) unsubscribe(sub *subscriber) {
 	s.mu.Lock()
-	if _, ok := s.subs[ch]; ok {
-		delete(s.subs, ch)
-		close(ch)
+	if _, ok := s.subs[sub]; ok {
+		delete(s.subs, sub)
+		close(sub.ch)
 	}
 	s.mu.Unlock()
-}
-
-func (s *stream) snapshot() (subs int, gopBytes int, gopMsgs int, dropped uint64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.subs), s.gopBytes, len(s.gop), s.droppedFrames
 }
 
 type hub struct {
@@ -499,10 +469,7 @@ func (srv *server) handle(conn net.Conn) {
 			return
 		}
 		if seamless {
-			_, gopBytes, gopMsgs, _ := s.snapshot()
-			logger.Info("seamless reconnect",
-				"peer", peer, "path", hs.path,
-				"gop_bytes", gopBytes, "gop_msgs", gopMsgs)
+			logger.Info("seamless reconnect", "peer", peer, "path", hs.path)
 		}
 		srv.servePush(conn, s, peer, seamless)
 		s.release()
@@ -584,26 +551,19 @@ func equalFramed(a, b *message) bool {
 }
 
 func (srv *server) servePull(conn net.Conn, s *stream, peer string) {
-	ch, header, gop, ok := s.subscribe()
+	sub, header, ok := s.subscribe()
 	if !ok {
 		logger.Warn("pull timed out waiting for publisher", "peer", peer, "path", s.path)
 		return
 	}
-	defer s.unsubscribe(ch)
+	defer s.unsubscribe(sub)
 
-	logger.Debug("pull catch-up sending",
-		"peer", peer, "path", s.path,
-		"header_bytes", header.size, "gop_msgs", len(gop))
+	logger.Debug("pull header sent", "peer", peer, "path", s.path, "header_bytes", header.size)
 
 	if _, err := conn.Write(header.framed); err != nil {
 		return
 	}
-	for _, m := range gop {
-		if _, err := conn.Write(m.framed); err != nil {
-			return
-		}
-	}
-	for m := range ch {
+	for m := range sub.ch {
 		if _, err := conn.Write(m.framed); err != nil {
 			return
 		}

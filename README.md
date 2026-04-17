@@ -1,6 +1,6 @@
 # smp
 
-SMP media relay — Go server and library. Real-time push/pull with fan-out, GOP caching, and seamless reconnection.
+SMP media relay — server and library. Real-time push/pull with fan-out and seamless publisher reconnection.
 
 ## Build
 
